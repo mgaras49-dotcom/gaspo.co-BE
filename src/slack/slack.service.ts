@@ -14,6 +14,11 @@ import {
   SlackUserLookupResponse,
 } from './interfaces/slack-oauth.interface';
 
+/** A shared file's bytes, or why they could not be fetched. */
+export type SlackFileDownload =
+  | { ok: true; data: Buffer }
+  | { ok: false; reason: 'no_access' | 'too_large' | 'gone' | 'failed' };
+
 /** The name a Slack member goes by: display name, then real name, then handle. */
 function slackDisplayName(user: NonNullable<SlackUserLookupResponse['user']>): string {
   const profile = user.profile ?? {};
@@ -264,6 +269,53 @@ export class SlackService {
         `${method} error: ${error instanceof Error ? error.message : String(error)}`,
       );
       return false;
+    }
+  }
+
+  /**
+   * Download a file a user shared, as the bot. Needs the `files:read` scope, and
+   * a token without it is not refused outright: Slack answers with its sign-in
+   * page instead of the file, so HTML back for a file that is not HTML means no
+   * access. The token only ever goes to Slack's own file host.
+   */
+  async downloadFile(
+    botToken: string,
+    url: string,
+    maxBytes: number,
+    mimetype: string | null,
+  ): Promise<SlackFileDownload> {
+    let host: URL;
+    try {
+      host = new URL(url);
+    } catch {
+      return { ok: false, reason: 'failed' };
+    }
+    if (host.protocol !== 'https:' || !/(^|\.)slack\.com$/.test(host.hostname)) {
+      this.logger.warn(`Refusing to send the bot token to ${host.hostname} for a file download`);
+      return { ok: false, reason: 'failed' };
+    }
+    try {
+      const response = await firstValueFrom(
+        this.httpService.get<ArrayBuffer>(url, {
+          headers: { Authorization: `Bearer ${botToken}` },
+          responseType: 'arraybuffer',
+          maxContentLength: maxBytes,
+          timeout: 30000,
+        }),
+      );
+      const contentType = String(response.headers['content-type'] ?? '');
+      if (contentType.startsWith('text/html') && !mimetype?.startsWith('text/html')) {
+        return { ok: false, reason: 'no_access' };
+      }
+      return { ok: true, data: Buffer.from(response.data) };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('maxContentLength')) return { ok: false, reason: 'too_large' };
+      const status = (error as { response?: { status?: number } }).response?.status;
+      if (status === 401 || status === 403) return { ok: false, reason: 'no_access' };
+      if (status === 404) return { ok: false, reason: 'gone' };
+      this.logger.warn(`Slack file download failed: ${message}`);
+      return { ok: false, reason: 'failed' };
     }
   }
 

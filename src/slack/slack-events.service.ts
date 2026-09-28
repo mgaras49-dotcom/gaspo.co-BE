@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { AiService } from '../ai/ai.service';
+import { MAX_ATTACHMENT_BYTES, MAX_RUN_ATTACHMENT_BYTES } from '../ai/attachments';
 import { MessageRole, UserRole } from '../common/enums';
 import { MessagesService } from '../memory/messages.service';
 import { UsersService } from '../users/users.service';
@@ -9,6 +10,14 @@ import {
   SlackMessageEvent,
   SlackTeamJoinEvent,
 } from './interfaces/slack-event.interface';
+import {
+  AttachmentBudget,
+  attachmentRef,
+  composePrompt,
+  FileDownloader,
+  loadAttachments,
+  resolveHistory,
+} from './slack-attachments';
 import { buildApprovalBlocks, buildWelcomeMessage } from './slack-messages';
 import { SlackInteractionsService } from './slack-interactions.service';
 import { SlackService } from './slack.service';
@@ -100,8 +109,10 @@ export class SlackEventsService {
 
     const teamId = envelope.team_id;
     const channel = message.channel;
-    const prompt = this.cleanText(message.text ?? '');
-    if (!teamId || !channel || !prompt) return;
+    const text = this.cleanText(message.text ?? '');
+    // A file sent with no words is still a request: "here, read this".
+    const files = message.files ?? [];
+    if (!teamId || !channel || (!text && !files.length)) return;
 
     const workspace = await this.workspacesService.findBySlackTeamId(teamId);
     if (!workspace?.slackBotToken) {
@@ -149,11 +160,33 @@ export class SlackEventsService {
         }
       }
 
+      // Files are fetched now, with the bot token, and again whenever a later
+      // turn replays this one. This message's files are served first, then the
+      // history's newest-first, out of one budget sized to what a request holds.
+      const download: FileDownloader = (ref) =>
+        this.slackService.downloadFile(botToken, ref.url, MAX_ATTACHMENT_BYTES, ref.mimetype);
+      const budget: AttachmentBudget = { remaining: MAX_RUN_ATTACHMENT_BYTES };
+      const refs = files.map(attachmentRef);
+      const current = await loadAttachments(
+        refs.flatMap((ref) => (ref.ok ? [ref.ref] : [])),
+        download,
+        budget,
+      );
+      const prompt = composePrompt(
+        text,
+        current.loaded.map((ref) => ref.name),
+        [...refs.flatMap((ref) => (ref.ok ? [] : [ref.problem])), ...current.problems],
+      );
+
       // Load prior turns BEFORE persisting this one, so the new prompt isn't
       // duplicated in its own history. Both calls are best-effort inside
       // MessagesService — memory never blocks a reply.
       const history = memoryThreadId
-        ? await this.messagesService.getThread(workspace.id, memoryThreadId)
+        ? await resolveHistory(
+            await this.messagesService.getThread(workspace.id, memoryThreadId),
+            download,
+            budget,
+          )
         : [];
       for (const threadId of [memoryThreadId, branchThreadId]) {
         if (!threadId) continue;
@@ -163,12 +196,14 @@ export class SlackEventsService {
           member?.id ?? null,
           MessageRole.USER,
           prompt,
+          current.loaded,
         );
       }
 
       const result = await this.aiService.run(workspace.id, member?.id ?? null, prompt, {
         sourceName: 'slack',
         history,
+        attachments: current.attachments,
         // Same key as the conversation memory: connected apps stay attached for
         // the life of a thread rather than being re-decided per message.
         conversationId: memoryThreadId,
@@ -274,9 +309,15 @@ export class SlackEventsService {
     );
   }
 
-  /** We act on app_mentions and direct messages, never on bot-authored posts. */
+  /**
+   * We act on app_mentions and direct messages, never on bot-authored posts.
+   * Other subtypes are edits, joins and the like, but `file_share` is a person
+   * sending a message with an upload — dropping it is what left Gaspo blind to
+   * every attachment.
+   */
   private isHandledMessage(event: SlackMessageEvent): boolean {
-    if (event.bot_id || event.subtype) return false;
+    if (event.bot_id) return false;
+    if (event.subtype && event.subtype !== 'file_share') return false;
     if (event.type === 'app_mention') return true;
     return event.type === 'message' && event.channel_type === 'im';
   }

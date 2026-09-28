@@ -2,7 +2,10 @@ import { Injectable, Logger, ServiceUnavailableException } from '@nestjs/common'
 import { ConfigService } from '@nestjs/config';
 import OpenAI from 'openai';
 import { AppConfig } from '../../config/configuration';
+import { Attachment, attachmentAsText } from '../attachments';
 import {
+  AttachmentRejectedError,
+  isAttachmentRejection,
   LlmProvider,
   ProviderMessage,
   ProviderRequest,
@@ -81,6 +84,9 @@ export class GatewayProvider implements LlmProvider {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error(`Gateway request failed: ${message}`);
+      if (isAttachmentRejection(request.messages, message)) {
+        throw new AttachmentRejectedError(message);
+      }
       throw new ServiceUnavailableException(`AI request failed: ${message}`);
     }
 
@@ -158,13 +164,47 @@ export class GatewayProvider implements LlmProvider {
     }
   }
 
+  /**
+   * An attachment in OpenAI's content-part dialect. Whether the routed model can
+   * read an image or PDF is up to it; one that cannot is rejected and retried
+   * without the file, like on Anthropic.
+   */
+  private attachmentPart(
+    attachment: Attachment,
+  ): OpenAI.Chat.Completions.ChatCompletionContentPart {
+    if (attachment.kind === 'image') {
+      return {
+        type: 'image_url',
+        image_url: { url: `data:${attachment.mediaType};base64,${attachment.data}` },
+      };
+    }
+    if (attachment.kind === 'pdf') {
+      return {
+        type: 'file',
+        file: {
+          filename: attachment.name,
+          file_data: `data:application/pdf;base64,${attachment.data}`,
+        },
+      };
+    }
+    return { type: 'text', text: attachmentAsText(attachment) };
+  }
+
   private toOpenAiMessages(
     messages: ProviderMessage[],
   ): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
     const rendered: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
     for (const message of messages) {
       if (message.role === 'user') {
-        rendered.push({ role: 'user', content: message.content });
+        rendered.push({
+          role: 'user',
+          content: message.attachments?.length
+            ? [
+                ...message.attachments.map((a) => this.attachmentPart(a)),
+                { type: 'text', text: message.content },
+              ]
+            : message.content,
+        });
       } else if (message.role === 'assistant') {
         rendered.push({
           role: 'assistant',

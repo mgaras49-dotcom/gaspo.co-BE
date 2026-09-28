@@ -12,6 +12,20 @@ import { User } from './user.entity';
 import { Workspace } from './workspace.entity';
 
 /**
+ * A file attached to a turn, kept by reference rather than content: the file
+ * stays in Slack, and a later turn fetches it again when it replays this one.
+ */
+export interface MessageAttachmentRef {
+  /** Slack file id. */
+  id: string;
+  name: string;
+  mimetype: string | null;
+  size: number | null;
+  /** Slack's `url_private_download`, fetched with the workspace's bot token. */
+  url: string;
+}
+
+/**
  * A single message in a conversation thread between a user and the assistant.
  */
 @Entity({ name: 'messages' })
@@ -35,6 +49,10 @@ export class Message {
 
   @Column({ type: 'text' })
   content!: string;
+
+  /** Files the user attached to this turn; null for turns without any. */
+  @Column({ type: 'jsonb', nullable: true })
+  attachments!: MessageAttachmentRef[] | null;
 
   @CreateDateColumn({ type: 'timestamptz' })
   createdAt!: Date;

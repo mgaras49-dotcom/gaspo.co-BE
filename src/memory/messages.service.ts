@@ -2,12 +2,14 @@ import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { MessageRole } from '../common/enums';
-import { Message } from '../database/entities';
+import { Message, MessageAttachmentRef } from '../database/entities';
 
 /** A prior conversation turn, shaped for replay into an AI run. */
 export interface ConversationTurn {
   role: 'user' | 'assistant';
   content: string;
+  /** Files attached to the turn, still to be fetched before they can be replayed. */
+  attachments?: MessageAttachmentRef[];
 }
 
 /** How many prior turns are replayed into a run at most. */
@@ -37,11 +39,19 @@ export class MessagesService {
     userId: string | null,
     role: MessageRole,
     content: string,
+    attachments: MessageAttachmentRef[] = [],
   ): Promise<void> {
     if (!content.trim()) return;
     try {
       await this.messageRepository.save(
-        this.messageRepository.create({ workspaceId, threadId, userId, role, content }),
+        this.messageRepository.create({
+          workspaceId,
+          threadId,
+          userId,
+          role,
+          content,
+          attachments: attachments.length ? attachments : null,
+        }),
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -70,6 +80,7 @@ export class MessagesService {
           row.content.length > TURN_CHAR_LIMIT
             ? `${row.content.slice(0, TURN_CHAR_LIMIT)}…`
             : row.content,
+        ...(row.attachments?.length ? { attachments: row.attachments } : {}),
       }));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

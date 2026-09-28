@@ -14,7 +14,9 @@ import {
 import { ToolRouterService } from './providers/tool-router.service';
 import { AttachedApps, AttachedAppsService } from './providers/attached-apps.service';
 import { buildCatalog, ModelDefinition } from './providers/model-catalog';
+import { Attachment } from './attachments';
 import {
+  AttachmentRejectedError,
   LlmProvider,
   McpConnectionError,
   ProviderMessage,
@@ -32,7 +34,6 @@ import {
   IntegrationsService,
 } from '../integrations/integrations.service';
 import { MetaAdsService } from '../integrations/meta-ads.service';
-import { ConversationTurn } from '../memory/messages.service';
 import { WorkspaceMemoryService } from '../memory/workspace-memory.service';
 import { PipedreamService } from '../integrations/pipedream.service';
 import { RoasService } from '../integrations/roas.service';
@@ -159,6 +160,8 @@ Connected apps are listed below annotated with whose account each one is: the re
 
 When greeting someone or introducing yourself (e.g. they just say "hi"), ground the intro in what is actually available to this specific person: the connected apps listed below — their own accounts first, then shared team ones — plus building Spaces and answering workspace questions. Do not recite a generic pitch or lead with capabilities whose apps are not connected.
 
+People can attach files to their messages, and the files come with the message: PDFs and images as the files themselves, Word, Excel, PowerPoint, CSV and text files as their extracted text. Read them and work from them; never say you cannot open or see attachments. A bracketed note saying a file could not be opened means that file did not come through — tell the user which one and why in a line, and what would work instead.
+
 Your replies are delivered in Slack, so format for Slack's mrkdwn — not Markdown: use *single asterisks* for bold (never **double**, which Slack shows literally), _underscores_ for italics, and a leading "• " for bullets. Don't use # headings or [text](url) links; write links as <https://example.com|label>.
 
 Be brief and lead with the answer. Put the direct response in the first sentence, then add only the detail the request actually needs. Prefer a few short sentences; use a short bulleted list only when giving steps or options. Don't restate the question, stack on caveats, or list the tools you have unless asked.`;
@@ -173,6 +176,13 @@ interface LocalToolResult {
   tool_use_id: string;
   content: string;
   is_error?: boolean;
+}
+
+/** A prior turn replayed into a run, with any files it carried already fetched. */
+export interface RunTurn {
+  role: 'user' | 'assistant';
+  content: string;
+  attachments?: Attachment[];
 }
 
 /** A tool the model invoked during a run, for surfacing what Gaspo did. */
@@ -463,7 +473,9 @@ export class AiService {
       confirmVia?: ConfirmMode;
       /** Prior turns of this conversation (oldest first), replayed ahead of the
        * prompt so the model has thread continuity. Omitted for fresh runs. */
-      history?: ConversationTurn[];
+      history?: RunTurn[];
+      /** Files attached to this prompt, sent alongside it. */
+      attachments?: Attachment[];
       /** Stable id for the conversation this run belongs to (a Slack thread).
        * Keeps connected apps attached across its turns instead of re-routing per
        * message; omitted for one-off runs, which route from scratch. */
@@ -751,13 +763,15 @@ export class AiService {
     // Prior turns (thread history) replay ahead of the new prompt, giving the
     // model conversation continuity; only final text turns are stored/replayed,
     // never tool_use blocks, so there are no dangling tool-result pairs.
+    // Files ride on the turn they were attached to, so a follow-up about a
+    // document shared three messages ago still has the document.
     const messages: ProviderMessage[] = [
       ...(options.history ?? []).map((turn) =>
         turn.role === 'assistant'
           ? { role: 'assistant' as const, content: turn.content, toolCalls: [] }
-          : { role: 'user' as const, content: turn.content },
+          : { role: 'user' as const, content: turn.content, attachments: turn.attachments },
       ),
-      { role: 'user' as const, content: prompt },
+      { role: 'user' as const, content: prompt, attachments: options.attachments },
     ];
     const actions: AiAction[] = [];
     const spaces: AiSpace[] = [];
@@ -793,19 +807,29 @@ export class AiService {
       try {
         response = await provider.create(request);
       } catch (error) {
-        // A single unreachable Pipedream MCP server makes Anthropic 400 the whole
-        // request, which would otherwise fail even prompts that need no app. Drop
-        // the connectors once and retry so the model can still answer locally.
-        if (!mcpServers.length || !(error instanceof McpConnectionError)) throw error;
-        this.logger.warn(
-          'A connected-app MCP server was unreachable; retrying without connected apps',
-        );
-        mcpServers = [];
-        bridged = null;
-        tools = [...localTools];
-        appSlugs = hasMeta ? ['meta_ads'] : [];
-        appsAvailable = hasMeta;
-        response = await provider.create({ ...request, tools, mcpServers });
+        if (error instanceof AttachmentRejectedError) {
+          // A file the model will not take fails the whole request. Drop the
+          // files once, say why, and let the model answer and explain.
+          this.logger.warn(
+            `An attached file was rejected; retrying without files: ${error.message}`,
+          );
+          this.dropAttachments(messages, error.message);
+          response = await provider.create(request);
+        } else {
+          // A single unreachable Pipedream MCP server makes Anthropic 400 the whole
+          // request, which would otherwise fail even prompts that need no app. Drop
+          // the connectors once and retry so the model can still answer locally.
+          if (!mcpServers.length || !(error instanceof McpConnectionError)) throw error;
+          this.logger.warn(
+            'A connected-app MCP server was unreachable; retrying without connected apps',
+          );
+          mcpServers = [];
+          bridged = null;
+          tools = [...localTools];
+          appSlugs = hasMeta ? ['meta_ads'] : [];
+          appsAvailable = hasMeta;
+          response = await provider.create({ ...request, tools, mcpServers });
+        }
       }
       inputTokens += response.usage.inputTokens;
       if (response.usage.costUsd !== undefined) {
@@ -949,6 +973,25 @@ export class AiService {
         }`,
       );
       return true;
+    }
+  }
+
+  /**
+   * Strip every attachment from the transcript in place, leaving a note on each
+   * turn that had one so the model can tell the user what went wrong with it.
+   * All of them go because the provider's error rarely says which file it was.
+   */
+  private dropAttachments(messages: ProviderMessage[], reason: string): void {
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i];
+      if (message.role !== 'user' || !message.attachments?.length) continue;
+      const names = message.attachments.map((attachment) => attachment.name).join(', ');
+      messages[i] = {
+        role: 'user',
+        content:
+          `${message.content}\n\n[The attached file(s) ${names} could not be read by the model, ` +
+          `so they are not included. The error was: ${reason.slice(0, 300)}]`,
+      };
     }
   }
 

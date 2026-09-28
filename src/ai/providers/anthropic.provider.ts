@@ -3,7 +3,10 @@ import { ConfigService } from '@nestjs/config';
 import Anthropic from '@anthropic-ai/sdk';
 import { AppConfig } from '../../config/configuration';
 import { CACHE_TTL } from './model-catalog';
+import { Attachment } from '../attachments';
 import {
+  AttachmentRejectedError,
+  isAttachmentRejection,
   LlmProvider,
   McpConnectionError,
   ProviderMessage,
@@ -129,6 +132,9 @@ export class AnthropicProvider implements LlmProvider {
       // A single unreachable MCP server makes Anthropic 400 the whole request;
       // surfaced as its own type so the caller can retry without connectors.
       if (message.includes('MCP server')) throw new McpConnectionError(message);
+      if (isAttachmentRejection(request.messages, message)) {
+        throw new AttachmentRejectedError(message);
+      }
       throw new ServiceUnavailableException(`AI request failed: ${message}`);
     }
 
@@ -144,7 +150,19 @@ export class AnthropicProvider implements LlmProvider {
   private toAnthropicMessages(messages: ProviderMessage[]): Anthropic.Beta.BetaMessageParam[] {
     return messages.map((message) => {
       if (message.role === 'user') {
-        return { role: 'user' as const, content: message.content };
+        if (!message.attachments?.length) {
+          return { role: 'user' as const, content: message.content };
+        }
+        // Files ahead of the words: Anthropic reads a question asked after its
+        // documents better than one asked before them. The text block stays last
+        // so the transcript cache marker below still has somewhere to go.
+        return {
+          role: 'user' as const,
+          content: [
+            ...message.attachments.map((attachment) => this.attachmentBlock(attachment)),
+            { type: 'text' as const, text: message.content },
+          ],
+        };
       }
       if (message.role === 'assistant') {
         if (message.raw) {
@@ -165,6 +183,24 @@ export class AnthropicProvider implements LlmProvider {
         })),
       };
     });
+  }
+
+  /** A PDF or image as the file itself; extracted text as a titled text document. */
+  private attachmentBlock(attachment: Attachment): Anthropic.Beta.BetaContentBlockParam {
+    if (attachment.kind === 'image') {
+      return {
+        type: 'image',
+        source: { type: 'base64', media_type: attachment.mediaType, data: attachment.data },
+      };
+    }
+    return {
+      type: 'document',
+      title: attachment.name,
+      source:
+        attachment.kind === 'pdf'
+          ? { type: 'base64', media_type: 'application/pdf', data: attachment.data }
+          : { type: 'text', media_type: 'text/plain', data: attachment.text },
+    };
   }
 
   /**
