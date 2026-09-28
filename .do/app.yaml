@@ -109,7 +109,7 @@ services:
       # value only visible to whoever opens the DO dashboard.
       - key: SUPER_ADMIN_EMAILS
         scope: RUN_TIME
-        value: abaid.ullah.hu@gmail.com
+        value: abaid.ullah.hu@gmail.com,matthew@thebusinessbuilders.com
       # ---- Secrets: replace the placeholder values in the DO dashboard ----
       - key: JWT_SECRET
         scope: RUN_TIME
