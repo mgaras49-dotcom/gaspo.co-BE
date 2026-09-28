@@ -16,6 +16,27 @@ export interface SlackMessageEvent {
   channel_type?: string;
   ts?: string;
   thread_ts?: string;
+  /** Files uploaded with the message; such a message has subtype `file_share`. */
+  files?: SlackFile[];
+}
+
+/** The slice of a Slack file object we read to download an attachment. */
+export interface SlackFile {
+  id: string;
+  name?: string;
+  title?: string;
+  mimetype?: string;
+  size?: number;
+  /**
+   * `hosted` for an upload, `snippet` for a text snippet; `external` for a
+   * linked Drive or Dropbox file, `tombstone` once deleted, `hidden_by_limit`
+   * past a free plan's history — none of those last three can be downloaded.
+   */
+  mode?: string;
+  url_private?: string;
+  url_private_download?: string;
+  /** `check_file_info` when Slack sends only the id (Slack Connect channels). */
+  file_access?: string;
 }
 
 /** The slice of a Slack user object we read from a `team_join` event. */

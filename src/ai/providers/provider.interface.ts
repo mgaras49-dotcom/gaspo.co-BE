@@ -1,3 +1,5 @@
+import type { Attachment } from '../attachments';
+
 /**
  * Provider-neutral shapes for a model run.
  *
@@ -45,7 +47,7 @@ export interface ToolResult {
  * did not produce a given turn rebuild it from `content` + `toolCalls` instead.
  */
 export type ProviderMessage =
-  | { role: 'user'; content: string }
+  | { role: 'user'; content: string; attachments?: Attachment[] }
   | { role: 'assistant'; content: string; toolCalls: ToolCall[]; raw?: unknown }
   | { role: 'tool'; results: ToolResult[] };
 
@@ -148,6 +150,31 @@ export class McpConnectionError extends Error {
     super(message);
     this.name = 'McpConnectionError';
   }
+}
+
+/**
+ * The model refused a file the user attached — a PDF over the page limit, an
+ * encrypted one, an image it cannot decode — and with it the whole request.
+ * AiService retries once without attachments, telling the model why, so the user
+ * hears what was wrong with the file instead of a generic failure.
+ */
+export class AttachmentRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AttachmentRejectedError';
+  }
+}
+
+/**
+ * Whether a failed request was refused over an attached file rather than for
+ * some other reason. Only asked when the request carried attachments, so a
+ * mention of "image" or "document" in an unrelated error cannot trigger it.
+ */
+export function isAttachmentRejection(messages: ProviderMessage[], errorMessage: string): boolean {
+  const hadAttachments = messages.some(
+    (message) => message.role === 'user' && Boolean(message.attachments?.length),
+  );
+  return hadAttachments && /\b(pdf|image|document|file)\b|too.large/i.test(errorMessage);
 }
 
 /** Adapter for one vendor's chat API. */

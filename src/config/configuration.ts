@@ -150,7 +150,7 @@ export const configuration = (): AppConfig => ({
     redirectUri: process.env.SLACK_REDIRECT_URI ?? 'http://localhost:3000/auth/slack/callback',
     scopes:
       process.env.SLACK_SCOPES ??
-      'app_mentions:read,chat:write,reactions:write,im:history,im:read,im:write,channels:history,groups:history,users:read,users:read.email,team:read',
+      'app_mentions:read,chat:write,reactions:write,im:history,im:read,im:write,channels:history,groups:history,users:read,users:read.email,team:read,files:read',
   },
   pipedream: {
     clientId: process.env.PIPEDREAM_CLIENT_ID ?? '',
