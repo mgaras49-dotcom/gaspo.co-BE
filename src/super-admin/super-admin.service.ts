@@ -1,8 +1,8 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Repository } from 'typeorm';
+import { In, ObjectLiteral, Repository, SelectQueryBuilder } from 'typeorm';
 import { CREDITS_PER_DOLLAR } from '../ai/providers/model-catalog';
-import { BugReportStatus, UserRole } from '../common/enums';
+import { BugReportStatus, SubscriptionStatus, UserRole } from '../common/enums';
 import {
   BugReport,
   CreditEvent,
@@ -14,6 +14,14 @@ import {
 } from '../database/entities';
 import { DateRange, GRANT_ALIAS, UsageService } from '../usage/usage.service';
 import { UsersService } from '../users/users.service';
+import {
+  ACTIVE_TRIAL_DAYS,
+  SUBSCRIBED_STATUSES,
+  StageCountRow,
+  WORKSPACE_STAGES,
+  WorkspaceStage,
+  summarizeSales,
+} from './sales';
 
 /**
  * Query-builder alias for `users`, deliberately not `user`.
@@ -42,6 +50,126 @@ export type WorkspaceSort = 'created' | 'members' | 'activity' | 'name';
 
 const WORKSPACE_SORTS: readonly WorkspaceSort[] = ['created', 'members', 'activity', 'name'];
 
+/** The cutoff a trial must have run something after to count as active. */
+function activeTrialSince(): Date {
+  return new Date(Date.now() - ACTIVE_TRIAL_DAYS * 86_400_000);
+}
+
+/**
+ * Credits granted, cash paid, and credits still live — one row per workspace.
+ *
+ * Builds onto a bare query builder so the same totals can be read directly or
+ * joined in as a subquery (the sales stage needs "has paid" and "has credits
+ * left" for every workspace at once).
+ *
+ * The allocation totals are folded to one row per grant *inside a subquery*
+ * before the join, which is the whole trick. Joining `credit_allocations`
+ * directly multiplies a grant's row by the number of times it has been drawn
+ * on, so `SUM(credits)` counts a twice-spent grant twice and a workspace's
+ * granted total climbs as it spends. That exact bug shipped once on the
+ * single-workspace balance query (see `UsageService.getBalance`); the
+ * pre-aggregated join makes it unrepresentable here.
+ *
+ * `live` counts only unexpired grants, matching what `getBalance` calls
+ * spendable, so a workspace's row and its drill-in never disagree.
+ */
+function grantTotalsQuery<T extends ObjectLiteral>(
+  qb: SelectQueryBuilder<T>,
+  workspaceIds?: string[],
+): SelectQueryBuilder<T> {
+  qb.from(CreditGrant, GRANT_ALIAS)
+    .leftJoin(
+      (sub) =>
+        sub
+          .select('allocation."grantId"', 'grantId')
+          .addSelect('SUM(allocation.credits)', 'spent')
+          .from('credit_allocations', 'allocation')
+          .groupBy('allocation."grantId"'),
+      'spend',
+      `spend."grantId" = ${GRANT_ALIAS}.id`,
+    )
+    .select(`${GRANT_ALIAS}."workspaceId"`, 'workspaceId')
+    .addSelect(`COALESCE(SUM(${GRANT_ALIAS}.credits), 0)`, 'granted')
+    .addSelect(`COALESCE(SUM(${GRANT_ALIAS}."amountCents"), 0)`, 'paid')
+    .addSelect(
+      `COALESCE(SUM(
+        CASE WHEN ${GRANT_ALIAS}."expiresAt" IS NULL OR ${GRANT_ALIAS}."expiresAt" > NOW()
+             THEN GREATEST(${GRANT_ALIAS}.credits - COALESCE(spend.spent, 0), 0)
+             ELSE 0 END
+      ), 0)`,
+      'live',
+    )
+    .groupBy(`${GRANT_ALIAS}."workspaceId"`);
+  if (workspaceIds) {
+    qb.where(`${GRANT_ALIAS}."workspaceId" IN (:...workspaceIds)`, { workspaceIds });
+  }
+  return qb;
+}
+
+/**
+ * Each workspace's sales stage (see {@link WorkspaceStage}), with its plan.
+ *
+ * The one definition of the funnel. The overview groups over it, the customer
+ * table filters on it, and each row carries it — all from this query, so the
+ * "3 active trials" on the overview is always the three rows the filter shows.
+ *
+ * Order in the CASE is precedence: a live plan outranks everything, a cancelled
+ * plan outranks later top-ups (losing a subscriber is the fact worth seeing),
+ * and only a workspace that has never paid is any kind of trial.
+ */
+function stageQuery<T extends ObjectLiteral>(
+  qb: SelectQueryBuilder<T>,
+  activeSince: Date,
+  workspaceIds?: string[],
+): SelectQueryBuilder<T> {
+  qb.select('workspace.id', 'workspaceId')
+    .addSelect('subscription."planId"', 'planId')
+    .addSelect('subscription.status', 'status')
+    .addSelect('COALESCE(subscription."cancelAtPeriodEnd", false)', 'cancelling')
+    .addSelect(
+      `CASE
+        WHEN subscription.status IN (:...subscribedStatuses) THEN 'subscribed'
+        WHEN subscription.status = :canceledStatus THEN 'canceled'
+        WHEN COALESCE(money.paid, 0) > 0 THEN 'topup_only'
+        WHEN COALESCE(money.live, 0) <= 0 THEN 'trial_spent'
+        WHEN runs.seen >= :activeSince THEN 'trial_active'
+        ELSE 'trial_idle'
+      END`,
+      'stage',
+    )
+    .from(Workspace, 'workspace')
+    .leftJoin(Subscription, 'subscription', 'subscription."workspaceId" = workspace.id')
+    .leftJoin(
+      (sub) => grantTotalsQuery(sub, workspaceIds),
+      'money',
+      'money."workspaceId" = workspace.id',
+    )
+    .leftJoin(
+      (sub) => {
+        sub
+          .select('run."workspaceId"', 'workspaceId')
+          .addSelect('MAX(run."createdAt")', 'seen')
+          .from(CreditEvent, 'run')
+          .groupBy('run."workspaceId"');
+        if (workspaceIds) {
+          sub.where('run."workspaceId" IN (:...workspaceIds)', { workspaceIds });
+        }
+        return sub;
+      },
+      'runs',
+      'runs."workspaceId" = workspace.id',
+    )
+    .setParameters({
+      subscribedStatuses: [...SUBSCRIBED_STATUSES],
+      canceledStatus: SubscriptionStatus.CANCELED,
+      activeSince,
+    });
+  if (workspaceIds) {
+    qb.andWhere('workspace.id IN (:...workspaceIds)', { workspaceIds });
+  }
+  return qb;
+}
+
 /** One tenant on the owner panel's workspace table. */
 export interface PlatformWorkspaceRow {
   id: string;
@@ -53,6 +181,8 @@ export interface PlatformWorkspaceRow {
   /** Cash actually taken for this workspace, in cents. */
   paidCents: number;
   plan: { planId: string; status: string; seats: number; currentPeriodEnd: Date } | null;
+  /** Where this workspace sits in the sales funnel. */
+  stage: WorkspaceStage;
   connectedAccounts: number;
   lastActivityAt: Date | null;
 }
@@ -64,6 +194,7 @@ interface WorkspaceAggregates {
   integrations: Map<string, number>;
   activity: Map<string, Date>;
   plans: Map<string, Subscription>;
+  stages: Map<string, WorkspaceStage>;
 }
 
 /**
@@ -102,18 +233,8 @@ export class SuperAdminService {
   ) {}
 
   /**
-   * Credits still live, spent, and granted — per workspace, in one query.
-   *
-   * The allocation totals are folded to one row per grant *inside a subquery*
-   * before the join, which is the whole trick. Joining `credit_allocations`
-   * directly multiplies a grant's row by the number of times it has been drawn
-   * on, so `SUM(credits)` counts a twice-spent grant twice and a workspace's
-   * granted total climbs as it spends. That exact bug shipped once on the
-   * single-workspace balance query (see `UsageService.getBalance`); the
-   * pre-aggregated join makes it unrepresentable here.
-   *
-   * `balance` counts only unexpired grants, matching what `getBalance` calls
-   * spendable, so a workspace's row and its drill-in never disagree.
+   * Credits still live, spent, and granted — per workspace, in one query. The
+   * grant side is {@link grantTotalsQuery}, which explains why it is shaped as it is.
    */
   private async creditsByWorkspace(
     workspaceIds: string[],
@@ -124,32 +245,10 @@ export class SuperAdminService {
     >();
     if (workspaceIds.length === 0) return out;
 
-    const grantRows = await this.creditGrantRepository
-      .createQueryBuilder(GRANT_ALIAS)
-      .leftJoin(
-        (sub) =>
-          sub
-            .select('allocation."grantId"', 'grantId')
-            .addSelect('SUM(allocation.credits)', 'spent')
-            .from('credit_allocations', 'allocation')
-            .groupBy('allocation."grantId"'),
-        'spend',
-        `spend."grantId" = ${GRANT_ALIAS}.id`,
-      )
-      .select(`${GRANT_ALIAS}."workspaceId"`, 'workspaceId')
-      .addSelect(`COALESCE(SUM(${GRANT_ALIAS}.credits), 0)`, 'granted')
-      .addSelect(`COALESCE(SUM(${GRANT_ALIAS}."amountCents"), 0)`, 'paid')
-      .addSelect(
-        `COALESCE(SUM(
-          CASE WHEN ${GRANT_ALIAS}."expiresAt" IS NULL OR ${GRANT_ALIAS}."expiresAt" > NOW()
-               THEN GREATEST(${GRANT_ALIAS}.credits - COALESCE(spend.spent, 0), 0)
-               ELSE 0 END
-        ), 0)`,
-        'live',
-      )
-      .where(`${GRANT_ALIAS}."workspaceId" IN (:...workspaceIds)`, { workspaceIds })
-      .groupBy(`${GRANT_ALIAS}."workspaceId"`)
-      .getRawMany<{ workspaceId: string; granted: string; paid: string; live: string }>();
+    const grantRows = await grantTotalsQuery(
+      this.creditGrantRepository.manager.createQueryBuilder(),
+      workspaceIds,
+    ).getRawMany<{ workspaceId: string; granted: string; paid: string; live: string }>();
 
     const usedRows = await this.creditEventRepository
       .createQueryBuilder('event')
@@ -180,44 +279,54 @@ export class SuperAdminService {
       integrations: new Map(),
       activity: new Map(),
       plans: new Map(),
+      stages: new Map(),
     };
     if (workspaceIds.length === 0) return empty;
 
-    const [memberRows, credits, integrationRows, activityRows, subscriptions] = await Promise.all([
-      this.userRepository
-        .createQueryBuilder(USER_ALIAS)
-        .select(`${USER_ALIAS}."workspaceId"`, 'workspaceId')
-        .addSelect(`COUNT(${USER_ALIAS}.id)`, 'total')
-        .addSelect(`COUNT(${USER_ALIAS}.id) FILTER (WHERE ${USER_ALIAS}."isActive")`, 'active')
-        .addSelect(
-          `COUNT(${USER_ALIAS}.id) FILTER (WHERE ${USER_ALIAS}.role = :adminRole)`,
-          'admins',
-        )
-        .where(`${USER_ALIAS}."workspaceId" IN (:...workspaceIds)`, { workspaceIds })
-        .setParameter('adminRole', UserRole.ADMIN)
-        .groupBy(`${USER_ALIAS}."workspaceId"`)
-        .getRawMany<{ workspaceId: string; total: string; active: string; admins: string }>(),
-      this.creditsByWorkspace(workspaceIds),
-      this.integrationRepository
-        .createQueryBuilder('integration')
-        .select('integration."workspaceId"', 'workspaceId')
-        .addSelect('COUNT(integration.id)', 'count')
-        .where('integration."workspaceId" IN (:...workspaceIds)', { workspaceIds })
-        .andWhere('integration."isActive"')
-        .groupBy('integration."workspaceId"')
-        .getRawMany<{ workspaceId: string; count: string }>(),
-      this.creditEventRepository
-        .createQueryBuilder('event')
-        .select('event."workspaceId"', 'workspaceId')
-        .addSelect('MAX(event."createdAt")', 'lastActivityAt')
-        .where('event."workspaceId" IN (:...workspaceIds)', { workspaceIds })
-        .groupBy('event."workspaceId"')
-        .getRawMany<{ workspaceId: string; lastActivityAt: Date }>(),
-      this.subscriptionRepository
-        .createQueryBuilder('subscription')
-        .where('subscription."workspaceId" IN (:...workspaceIds)', { workspaceIds })
-        .getMany(),
-    ]);
+    const [memberRows, credits, integrationRows, activityRows, subscriptions, stageRows] =
+      await Promise.all([
+        this.userRepository
+          .createQueryBuilder(USER_ALIAS)
+          .select(`${USER_ALIAS}."workspaceId"`, 'workspaceId')
+          .addSelect(`COUNT(${USER_ALIAS}.id)`, 'total')
+          .addSelect(`COUNT(${USER_ALIAS}.id) FILTER (WHERE ${USER_ALIAS}."isActive")`, 'active')
+          .addSelect(
+            `COUNT(${USER_ALIAS}.id) FILTER (WHERE ${USER_ALIAS}.role = :adminRole)`,
+            'admins',
+          )
+          .where(`${USER_ALIAS}."workspaceId" IN (:...workspaceIds)`, { workspaceIds })
+          .setParameter('adminRole', UserRole.ADMIN)
+          .groupBy(`${USER_ALIAS}."workspaceId"`)
+          .getRawMany<{ workspaceId: string; total: string; active: string; admins: string }>(),
+        this.creditsByWorkspace(workspaceIds),
+        this.integrationRepository
+          .createQueryBuilder('integration')
+          .select('integration."workspaceId"', 'workspaceId')
+          .addSelect('COUNT(integration.id)', 'count')
+          .where('integration."workspaceId" IN (:...workspaceIds)', { workspaceIds })
+          .andWhere('integration."isActive"')
+          .groupBy('integration."workspaceId"')
+          .getRawMany<{ workspaceId: string; count: string }>(),
+        this.creditEventRepository
+          .createQueryBuilder('event')
+          .select('event."workspaceId"', 'workspaceId')
+          .addSelect('MAX(event."createdAt")', 'lastActivityAt')
+          .where('event."workspaceId" IN (:...workspaceIds)', { workspaceIds })
+          .groupBy('event."workspaceId"')
+          .getRawMany<{ workspaceId: string; lastActivityAt: Date }>(),
+        this.subscriptionRepository
+          .createQueryBuilder('subscription')
+          .where('subscription."workspaceId" IN (:...workspaceIds)', { workspaceIds })
+          .getMany(),
+        // Re-reads credits and activity the queries above already have, rather
+        // than deriving the stage from them in JavaScript: a second copy of the
+        // rule here would be free to drift from the SQL the overview counts with.
+        stageQuery(
+          this.workspaceRepository.manager.createQueryBuilder(),
+          activeTrialSince(),
+          workspaceIds,
+        ).getRawMany<{ workspaceId: string; stage: WorkspaceStage }>(),
+      ]);
 
     return {
       members: new Map(
@@ -230,6 +339,7 @@ export class SuperAdminService {
       integrations: new Map(integrationRows.map((row) => [row.workspaceId, Number(row.count)])),
       activity: new Map(activityRows.map((row) => [row.workspaceId, row.lastActivityAt])),
       plans: new Map(subscriptions.map((row) => [row.workspaceId, row])),
+      stages: new Map(stageRows.map((row) => [row.workspaceId, row.stage])),
     };
   }
 
@@ -260,6 +370,9 @@ export class SuperAdminService {
             currentPeriodEnd: plan.currentPeriodEnd,
           }
         : null,
+      // Every workspace has a stage row; the fallback is only for one created
+      // between the page query and this one.
+      stage: aggregates.stages.get(workspace.id) ?? 'trial_idle',
       connectedAccounts: aggregates.integrations.get(workspace.id) ?? 0,
       lastActivityAt: aggregates.activity.get(workspace.id) ?? null,
     };
@@ -281,13 +394,27 @@ export class SuperAdminService {
    * to `workspaces` at once multiplies every member by every run.
    */
   async listWorkspaces(
-    options: { search?: string; limit?: number; offset?: number; sort?: WorkspaceSort } = {},
-  ): Promise<{ total: number; rows: PlatformWorkspaceRow[]; sort: WorkspaceSort }> {
+    options: {
+      search?: string;
+      limit?: number;
+      offset?: number;
+      sort?: WorkspaceSort;
+      stage?: WorkspaceStage;
+    } = {},
+  ): Promise<{
+    total: number;
+    rows: PlatformWorkspaceRow[];
+    sort: WorkspaceSort;
+    stage: WorkspaceStage | null;
+  }> {
     const limit = Math.min(Math.max(options.limit ?? 50, 1), 200);
     const offset = Math.max(options.offset ?? 0, 0);
     const sort: WorkspaceSort = WORKSPACE_SORTS.includes(options.sort as WorkspaceSort)
       ? (options.sort as WorkspaceSort)
       : 'created';
+    const stage = WORKSPACE_STAGES.includes(options.stage as WorkspaceStage)
+      ? (options.stage as WorkspaceStage)
+      : null;
     const search = options.search?.trim();
 
     // Matched on the two identifiers the owner actually has to hand when
@@ -345,8 +472,20 @@ export class SuperAdminService {
 
     const counter = this.workspaceRepository.createQueryBuilder('workspace');
     if (search) {
-      driver.where(searchClause, searchParams);
-      counter.where(searchClause, searchParams);
+      driver.andWhere(searchClause, searchParams);
+      counter.andWhere(searchClause, searchParams);
+    }
+    if (stage) {
+      const activeSince = activeTrialSince();
+      for (const query of [driver, counter]) {
+        query
+          .innerJoin(
+            (sub) => stageQuery(sub, activeSince),
+            'stages',
+            'stages."workspaceId" = workspace.id',
+          )
+          .andWhere('stages.stage = :stage', { stage });
+      }
     }
 
     const [ordered, total] = await Promise.all([
@@ -355,7 +494,7 @@ export class SuperAdminService {
     ]);
 
     const ids = ordered.map((row) => row.id);
-    if (ids.length === 0) return { total, rows: [], sort };
+    if (ids.length === 0) return { total, rows: [], sort, stage };
 
     const [workspaces, aggregates] = await Promise.all([
       this.workspaceRepository.find({ where: { id: In(ids) } }),
@@ -370,7 +509,7 @@ export class SuperAdminService {
       .filter((workspace): workspace is Workspace => workspace !== undefined)
       .map((workspace) => this.toWorkspaceRow(workspace, aggregates));
 
-    return { total, rows, sort };
+    return { total, rows, sort, stage };
   }
 
   /**
@@ -522,6 +661,7 @@ export class SuperAdminService {
       bugCounts,
       teams,
       activeWorkspaces,
+      stageRows,
     ] = await Promise.all([
       this.workspaceRepository.count(),
       this.workspaceRepository
@@ -576,6 +716,21 @@ export class SuperAdminService {
         .select('COUNT(DISTINCT event."workspaceId")', 'count')
         .where('event."createdAt" >= :from', { from })
         .getRawOne<{ count: string }>(),
+      // The funnel, grouped by plan so MRR can be priced off the ladder. Its
+      // trial window is fixed rather than following `days`: the customer
+      // table's stage filter has no window, and the two must count alike.
+      this.workspaceRepository.manager
+        .createQueryBuilder()
+        .select('stages.stage', 'stage')
+        .addSelect('stages."planId"', 'planId')
+        .addSelect('COUNT(*)', 'count')
+        .addSelect('COUNT(*) FILTER (WHERE stages.status = :pastDueStatus)', 'pastDue')
+        .addSelect('COUNT(*) FILTER (WHERE stages.cancelling)', 'cancelling')
+        .from((sub) => stageQuery(sub, activeTrialSince()), 'stages')
+        .setParameter('pastDueStatus', SubscriptionStatus.PAST_DUE)
+        .groupBy('stages.stage')
+        .addGroupBy('stages."planId"')
+        .getRawMany<Record<keyof StageCountRow, string | null>>(),
     ]);
 
     const windowChargedUsd = Number(windowEvents?.credits ?? 0) / CREDITS_PER_DOLLAR;
@@ -604,6 +759,16 @@ export class SuperAdminService {
         totalCents: Number(grantTotals?.paid ?? 0),
         windowCents: Number(windowGrants?.paid ?? 0),
       },
+      // Paying customers, trials and MRR — the sales view of the same tenants.
+      sales: summarizeSales(
+        stageRows.map((row) => ({
+          stage: row.stage as WorkspaceStage,
+          planId: row.planId,
+          count: Number(row.count ?? 0),
+          pastDue: Number(row.pastDue ?? 0),
+          cancelling: Number(row.cancelling ?? 0),
+        })),
+      ),
       credits: {
         granted: Number(grantTotals?.credits ?? 0),
         used: Number(eventTotals?.credits ?? 0),
