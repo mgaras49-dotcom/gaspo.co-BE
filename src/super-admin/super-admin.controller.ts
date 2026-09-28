@@ -12,6 +12,7 @@ import { ApiTags } from '@nestjs/swagger';
 import { BugReportStatus } from '../common/enums';
 import { UpdateBugReportDto } from './dto';
 import { SuperAdminGuard } from './guards/super-admin.guard';
+import type { WorkspaceStage } from './sales';
 import { SuperAdminService, type WorkspaceSort } from './super-admin.service';
 
 /** Clamp a `days` query param to a window the aggregates can serve. */
@@ -54,15 +55,18 @@ export class SuperAdminController {
     @Query('limit') limit?: string,
     @Query('offset') offset?: string,
     @Query('sort') sort?: string,
+    @Query('stage') stage?: string,
   ) {
-    // An unrecognised sort falls back to the default rather than erroring, for
-    // the same reason the bug filter below does: this is a view preference
-    // arriving from a URL, and a stale link should still render the table.
+    // An unrecognised sort or stage falls back to the default rather than
+    // erroring, for the same reason the bug filter below does: this is a view
+    // preference arriving from a URL, and a stale link should still render the
+    // table.
     return this.superAdminService.listWorkspaces({
       search,
       limit: limit ? Number(limit) : undefined,
       offset: offset ? Number(offset) : undefined,
       sort: sort as WorkspaceSort | undefined,
+      stage: stage as WorkspaceStage | undefined,
     });
   }
 
