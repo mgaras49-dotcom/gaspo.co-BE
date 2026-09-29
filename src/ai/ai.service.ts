@@ -37,6 +37,7 @@ import { MetaAdsService } from '../integrations/meta-ads.service';
 import { WorkspaceMemoryService } from '../memory/workspace-memory.service';
 import { PipedreamService } from '../integrations/pipedream.service';
 import { RoasService } from '../integrations/roas.service';
+import { XeroReportName, XeroService } from '../integrations/xero.service';
 import { ExportsService } from '../exports/exports.service';
 import { RulesService } from '../rules/rules.service';
 import { SpacesService } from '../spaces/spaces.service';
@@ -101,6 +102,7 @@ import {
   TASK_TOOLS,
 } from './task-tools';
 import { GET_WORKSPACE_STATS, WORKSPACE_TOOLS } from './workspace-tools';
+import { XERO_GET_REPORT, XERO_TOOLS } from './xero-tools';
 
 /**
  * Balance under which replies carry a top-up nudge: $10 of credits.
@@ -110,6 +112,9 @@ import { GET_WORKSPACE_STATS, WORKSPACE_TOOLS } from './workspace-tools';
  * the nudge fired at $2.50 and reported a balance four times its real size.
  */
 const LOW_BALANCE_CREDITS = 10 * CREDITS_PER_DOLLAR;
+
+/** Pipedream's slug for the Xero Accounting app. */
+const XERO_APP_SLUG = 'xero_accounting_api';
 
 /**
  * How long one low-balance nudge suppresses the next in the same conversation.
@@ -170,6 +175,8 @@ You can schedule work to run on its own. When someone asks for something recurri
 You have a durable workspace memory that persists across every conversation. When the user states a lasting fact, preference, target, or standing instruction (e.g. "our target ROAS is 3", "always report in EUR"), save it with remember_fact — silently, without announcing it. Saved facts appear in your context under "Workspace memory"; treat them as current truth. Update a fact by re-saving its key; delete a retracted one with forget_fact. Never save transient, one-off request details.
 
 When the user asks what you can do — overall or about a specific connected app — give a structured, scannable answer rather than a one-liner: confirm which relevant app(s) are connected, name the specific account when a quick read-only tool call can tell you (e.g. list Meta ad accounts to name the account and currency), group the concrete capabilities into a few labelled sections, and finish with 2–3 example prompts the user could send. This capability-overview case is the one exception to the brevity rule below.
+
+Numbers from the user's own business — revenue, profit, spend, balances, counts — must come from a tool result in this conversation. Never state one from memory, an estimate, or arithmetic over data you did not actually retrieve, and never present a reconstruction as the official figure. If the tool that would give the real number fails, say it failed and what you could get instead. Industry benchmarks are fine when labelled as benchmarks.
 
 Connected apps are listed below annotated with whose account each one is: the requester's own private account, or a shared team account labelled with the member who connected it. Ownership is load-bearing. When the user asks for THEIR OWN data ("my email", "my calendar", "my repos") and the only matching app is a shared team account connected by a different member, do not silently read it — say whose account it is and confirm that is what they want first. Never present another member's account or its contents as if it were the user's own. If an app the user names is not in the list, it is not connected for them in this workspace — say so plainly rather than guessing why.
 
@@ -297,6 +304,7 @@ export class AiService {
     private readonly usersService: UsersService,
     private readonly workspaceMemory: WorkspaceMemoryService,
     private readonly roasService: RoasService,
+    private readonly xeroService: XeroService,
     private readonly rulesService: RulesService,
     private readonly exportsService: ExportsService,
     private readonly anthropicProvider: AnthropicProvider,
@@ -612,6 +620,8 @@ export class AiService {
     // Export automation writes through the Sheets API directly, so it needs the
     // workspace's own Google Sheets connection.
     const hasSheets = pipedreamConnected.some((c) => c.appSlug === 'google_sheets');
+    // Xero's reports are read through the proxy, not Pipedream's actions.
+    const hasXero = pipedreamConnected.some((c) => c.appSlug === XERO_APP_SLUG);
     const localTools: ToolSpec[] = [
       ...LOCAL_TOOLS,
       ...(hasMeta ? META_ADS_TOOLS : []),
@@ -619,6 +629,7 @@ export class AiService {
       // The rule engine acts on Meta, so its tools ride along with a Meta account.
       ...(hasMeta ? RULE_TOOLS : []),
       ...(hasSheets ? SHEETS_TOOLS : []),
+      ...(hasXero ? XERO_TOOLS : []),
     ];
 
     // The apps this run ended up with, filled in once the toolset is resolved
@@ -711,6 +722,14 @@ export class AiService {
         'remembered sheet (e.g. an "export_sheet_id" fact) instead of creating new spreadsheets ' +
         'each time, remember the sheet id the first time one is created, and always give the ' +
         'user the spreadsheet link.';
+    }
+    if (hasXero) {
+      system +=
+        '\n\nXero is connected. For profit, margin, revenue, expenses or financial position, ' +
+        "always use xero_get_report — it returns Xero's own Profit & Loss, Balance Sheet and " +
+        "other reports in the organisation's base currency. Never total invoices or bills to " +
+        'answer those: invoices come in mixed currencies and miss journals, credit notes and ' +
+        'expenses. Name the Xero organisation and currency the figures are for.';
     }
     // Rule-engine guidance rides along with a Meta connection.
     if (hasMeta) {
@@ -1104,6 +1123,7 @@ export class AiService {
     if (RULE_TOOL_NAMES.has(toolName)) return 'rules';
     if (SHEETS_TOOL_NAMES.has(toolName)) return 'google_sheets';
     if (TASK_TOOL_NAMES.has(toolName)) return 'tasks';
+    if (toolName === XERO_GET_REPORT) return XERO_APP_SLUG;
     return 'spaces';
   }
 
@@ -1141,7 +1161,57 @@ export class AiService {
     if (TASK_TOOL_NAMES.has(toolUse.name)) {
       return this.runTaskTool(workspaceId, userId, toolUse, ctx);
     }
+    if (toolUse.name === XERO_GET_REPORT) {
+      return this.runXeroTool(workspaceId, userId, toolUse);
+    }
     return this.runSpaceTool(workspaceId, userId, toolUse, spaces);
+  }
+
+  /**
+   * Pull a Xero report through the Connect proxy. A failure (no reports scope,
+   * several organisations, a bad date) goes back to the model as an error it
+   * can relay, so it says what went wrong instead of estimating.
+   */
+  private async runXeroTool(
+    workspaceId: string,
+    userId: string | null,
+    toolUse: ToolCall,
+  ): Promise<LocalToolResult> {
+    const input = (toolUse.input ?? {}) as Record<string, unknown>;
+    const text = (key: string): string | undefined =>
+      typeof input[key] === 'string' && (input[key] as string).trim()
+        ? (input[key] as string).trim()
+        : undefined;
+    try {
+      const credential = await this.integrationsService.getProxyCredential(
+        workspaceId,
+        userId,
+        XERO_APP_SLUG,
+      );
+      if (!credential) throw new Error('No Xero account is connected for this member');
+      const content = await this.xeroService.getReport(
+        credential,
+        String(input.report) as XeroReportName,
+        {
+          fromDate: text('from_date'),
+          toDate: text('to_date'),
+          date: text('date'),
+          periods: typeof input.periods === 'number' ? input.periods : undefined,
+          timeframe: text('timeframe') as 'MONTH' | 'QUARTER' | 'YEAR' | undefined,
+          organisation: text('organisation'),
+        },
+      );
+      return { type: 'tool_result', tool_use_id: toolUse.id, content };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`Xero report ${String(input.report)} failed: ${message}`);
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUse.id,
+        content: `Xero report failed: ${message}`,
+        is_error: true,
+      };
+    }
   }
 
   /**
