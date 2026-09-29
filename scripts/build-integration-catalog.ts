@@ -32,6 +32,13 @@ const PAGE_SIZE = 100;
  */
 const iconTemplate = (appId: string) => `https://assets.pipedream.net/s.v0/${appId}/logo/orig`;
 
+/**
+ * Apps left out of the snapshot. Shopify Partner reads Shopify's developer
+ * programme, not a store, and sat beside the two store connectors looking like
+ * a third way to connect a shop.
+ */
+const HIDDEN_SLUGS = new Set(['shopify_partner']);
+
 /** `[name, nameSlug, appId | full icon URL]` — positional to keep the file small. */
 type CatalogEntry = [string, string, string];
 
@@ -70,10 +77,18 @@ async function main(): Promise<void> {
     for (const app of page.data) {
       // A slug is what every downstream lookup keys on (connect, configure
       // routes, connected-account grouping), so skip anything without one.
-      if (!app.nameSlug || seen.has(app.nameSlug)) continue;
+      if (!app.id || !app.nameSlug || seen.has(app.nameSlug) || HIDDEN_SLUGS.has(app.nameSlug)) {
+        continue;
+      }
       seen.add(app.nameSlug);
       const expected = iconTemplate(app.id);
-      entries.push([app.name, app.nameSlug, app.imgSrc === expected ? app.id : (app.imgSrc ?? '')]);
+      // Pipedream's names can carry stray whitespace ("Shopify "), which shows
+      // up in the dashboard and breaks exact-name lookups.
+      entries.push([
+        app.name.trim(),
+        app.nameSlug,
+        app.imgSrc === expected ? app.id : (app.imgSrc ?? ''),
+      ]);
     }
     after = page.hasNextPage() ? page.response.pageInfo?.endCursor : undefined;
     pages += 1;
