@@ -2,12 +2,16 @@ import { Body, Controller, Delete, Get, Param, Patch, Post } from '@nestjs/commo
 import { ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../common/decorators';
 import { CreateTaskDto, UpdateTaskDto } from './dto';
+import { TaskRunnerService } from './task-runner.service';
 import { TasksService, TaskView } from './tasks.service';
 
 @ApiTags('tasks')
 @Controller('tasks')
 export class TasksController {
-  constructor(private readonly tasksService: TasksService) {}
+  constructor(
+    private readonly tasksService: TasksService,
+    private readonly taskRunner: TaskRunnerService,
+  ) {}
 
   /** List the scheduled tasks for the current workspace. */
   @Get()
@@ -46,7 +50,7 @@ export class TasksController {
     @CurrentUser('userId') userId: string,
     @Param('id') id: string,
   ): Promise<TaskView> {
-    return this.tasksService.runNow(workspaceId, id, userId);
+    return this.taskRunner.runNow(workspaceId, id, userId);
   }
 
   /** Delete a task. */

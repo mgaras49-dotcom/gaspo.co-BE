@@ -47,6 +47,23 @@ const CACHE: Anthropic.Beta.BetaCacheControlEphemeral = { type: 'ephemeral', ttl
 const TRANSCRIPT_BREAKPOINTS = 2;
 
 /**
+ * Anthropic's server-side web tools, run on its side like the MCP connectors.
+ * The 20260209 versions filter results with code execution before they reach
+ * the context, which keeps search-heavy research from flooding the prompt; they
+ * need Sonnet 5 / Opus 4.6 or later, which is everything in the catalogue.
+ *
+ * max_uses caps one request's searches (each is billed) and fetches;
+ * max_content_tokens stops one huge page from eating the context.
+ */
+const WEB_TOOLS: Anthropic.Beta.BetaToolUnion[] = [
+  { type: 'web_search_20260209', name: 'web_search', max_uses: 8 },
+  { type: 'web_fetch_20260209', name: 'web_fetch', max_uses: 10, max_content_tokens: 40000 },
+];
+
+/** Server tools reported in the run audit, under this app label. */
+const WEB_TOOL_NAMES = new Set(['web_search', 'web_fetch']);
+
+/**
  * Anthropic adapter. Connected apps are handed over as server-side MCP servers,
  * so Anthropic runs those tools itself and we only execute our own local tools —
  * the arrangement Gaspo has always used, kept intact.
@@ -98,6 +115,7 @@ export class AnthropicProvider implements LlmProvider {
         description: tool.description,
         input_schema: tool.parameters as Anthropic.Beta.BetaTool['input_schema'],
       })),
+      ...(request.webAccess ? WEB_TOOLS : []),
     ];
     const mcpServers = request.mcpServers.map((server) => ({
       type: 'url' as const,
@@ -245,6 +263,8 @@ export class AnthropicProvider implements LlmProvider {
     let text = '';
     const toolCalls: ToolCall[] = [];
     const remoteActivity: RemoteToolActivity[] = [];
+    // Web tool calls by id, so a result can mark its call as failed.
+    const webCalls = new Map<string, RemoteToolActivity>();
 
     for (const block of response.content) {
       if (block.type === 'text') {
@@ -256,6 +276,20 @@ export class AnthropicProvider implements LlmProvider {
         // always the last one pushed.
         const last = remoteActivity[remoteActivity.length - 1];
         if (last) last.isError = block.is_error ?? false;
+      } else if (block.type === 'server_tool_use' && WEB_TOOL_NAMES.has(block.name)) {
+        const activity = { app: 'web', tool: block.name, isError: false };
+        webCalls.set(block.id, activity);
+        remoteActivity.push(activity);
+      } else if (
+        block.type === 'web_search_tool_result' ||
+        block.type === 'web_fetch_tool_result'
+      ) {
+        // Failures arrive as HTTP 200 with an error object in place of results.
+        const call = webCalls.get(block.tool_use_id);
+        const content = block.content as { type?: string } | unknown[];
+        if (call && !Array.isArray(content)) {
+          call.isError = Boolean(content.type?.endsWith('_error'));
+        }
       } else if (block.type === 'tool_use') {
         toolCalls.push({
           id: block.id,
@@ -290,6 +324,7 @@ export class AnthropicProvider implements LlmProvider {
         outputTokens: response.usage.output_tokens,
         cacheWriteTokens: cacheWrites,
         cacheReadTokens: cacheReads,
+        webSearches: response.usage.server_tool_use?.web_search_requests ?? 0,
       },
       stopReason,
       raw: response.content,

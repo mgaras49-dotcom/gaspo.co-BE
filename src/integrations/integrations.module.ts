@@ -10,6 +10,7 @@ import { RoasService } from './roas.service';
 import { SheetsService } from './sheets.service';
 import { StripeService } from './stripe.service';
 import { RoasController } from './roas.controller';
+import { XeroService } from './xero.service';
 
 @Module({
   imports: [TypeOrmModule.forFeature([Integration, RoasSnapshot])],
@@ -22,6 +23,7 @@ import { RoasController } from './roas.controller';
     StripeService,
     SheetsService,
     RoasService,
+    XeroService,
   ],
   exports: [
     IntegrationsService,
@@ -31,6 +33,7 @@ import { RoasController } from './roas.controller';
     StripeService,
     SheetsService,
     RoasService,
+    XeroService,
   ],
 })
 export class IntegrationsModule {}

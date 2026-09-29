@@ -206,13 +206,23 @@ export class PipedreamService implements OnModuleInit {
    */
   async proxyRequest<T>(
     target: { externalUserId: string; accountId: string },
-    request: { url: string; method?: 'GET' | 'POST'; body?: Record<string, unknown> },
+    request: {
+      url: string;
+      method?: 'GET' | 'POST';
+      body?: Record<string, unknown>;
+      /** Query parameters for the target API. */
+      params?: Record<string, string>;
+      /** Headers for the target API (Pipedream forwards them unprefixed). */
+      headers?: Record<string, string>;
+    },
   ): Promise<T> {
     const client = this.getClient();
     const common = {
       url: request.url,
       externalUserId: target.externalUserId,
       accountId: target.accountId,
+      ...(request.params ? { params: request.params } : {}),
+      ...(request.headers ? { headers: request.headers } : {}),
     };
     try {
       const response =

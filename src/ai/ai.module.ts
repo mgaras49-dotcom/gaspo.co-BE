@@ -4,6 +4,7 @@ import { IntegrationsModule } from '../integrations/integrations.module';
 import { MemoryModule } from '../memory/memory.module';
 import { RulesModule } from '../rules/rules.module';
 import { SpacesModule } from '../spaces/spaces.module';
+import { TasksModule } from '../tasks/tasks.module';
 import { UsageModule } from '../usage/usage.module';
 import { UsersModule } from '../users/users.module';
 import { WorkspacesModule } from '../workspaces/workspaces.module';
@@ -22,6 +23,7 @@ import { ToolRouterService } from './providers/tool-router.service';
     MemoryModule,
     RulesModule,
     SpacesModule,
+    TasksModule,
     UsageModule,
     UsersModule,
     WorkspacesModule,

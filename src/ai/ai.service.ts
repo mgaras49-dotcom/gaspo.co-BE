@@ -37,9 +37,11 @@ import { MetaAdsService } from '../integrations/meta-ads.service';
 import { WorkspaceMemoryService } from '../memory/workspace-memory.service';
 import { PipedreamService } from '../integrations/pipedream.service';
 import { RoasService } from '../integrations/roas.service';
+import { XeroReportName, XeroService } from '../integrations/xero.service';
 import { ExportsService } from '../exports/exports.service';
 import { RulesService } from '../rules/rules.service';
 import { SpacesService } from '../spaces/spaces.service';
+import { TasksService } from '../tasks/tasks.service';
 import { validationReasons } from '../spaces/spec/validate-spec';
 import { CREDITS_PER_DOLLAR, UsageService } from '../usage/usage.service';
 import { UsersService } from '../users/users.service';
@@ -92,7 +94,15 @@ import {
   SHEETS_TOOLS,
 } from './sheets-tools';
 import { SPACE_TOOLS } from './space-tools';
+import {
+  CREATE_SCHEDULED_TASK,
+  DELETE_SCHEDULED_TASK,
+  LIST_SCHEDULED_TASKS,
+  TASK_TOOL_NAMES,
+  TASK_TOOLS,
+} from './task-tools';
 import { GET_WORKSPACE_STATS, WORKSPACE_TOOLS } from './workspace-tools';
+import { XERO_GET_REPORT, XERO_TOOLS } from './xero-tools';
 
 /**
  * Balance under which replies carry a top-up nudge: $10 of credits.
@@ -102,6 +112,9 @@ import { GET_WORKSPACE_STATS, WORKSPACE_TOOLS } from './workspace-tools';
  * the nudge fired at $2.50 and reported a balance four times its real size.
  */
 const LOW_BALANCE_CREDITS = 10 * CREDITS_PER_DOLLAR;
+
+/** Pipedream's slug for the Xero Accounting app. */
+const XERO_APP_SLUG = 'xero_accounting_api';
 
 /**
  * How long one low-balance nudge suppresses the next in the same conversation.
@@ -144,17 +157,26 @@ const SPACE_TOOL_ACTIONS: Record<string, string> = {
  * reading workspace facts. Sent on every run alongside any connected-app MCP
  * toolsets, and kept as the sole tools when the MCP connector is dropped.
  */
-const LOCAL_TOOLS: ToolSpec[] = [...SPACE_TOOLS, ...WORKSPACE_TOOLS, ...MEMORY_TOOLS];
+const LOCAL_TOOLS: ToolSpec[] = [
+  ...SPACE_TOOLS,
+  ...WORKSPACE_TOOLS,
+  ...MEMORY_TOOLS,
+  ...TASK_TOOLS,
+];
 
-const SYSTEM_PROMPT = `You are Gaspo, an AI assistant for a workspace. You can take actions across the user's connected apps using the available tools. Prefer acting over describing: when a request maps to a tool, use it. When you lack a connected app needed for a request, say so plainly and name the app to connect. Before any action that creates, edits, deletes, or starts spending on a connected app — especially Meta Ads campaigns (creating, activating, changing budgets, or deleting) — state exactly what you will do and get the user's explicit confirmation first; never perform such actions speculatively.
+const SYSTEM_PROMPT = `You are Gaspo, an AI assistant for a workspace. You can take actions across the user's connected apps using the available tools. Prefer acting over describing: when a request maps to a tool, use it. When you lack a connected app needed for a request, say so plainly and name the app to connect. Shopify is the one app that cannot connect in one click: Shopify only admits outside tools through a custom app the store owner creates. If asked how to connect it, walk them through it — in the Shopify Dev Dashboard create an app, paste in the redirect URL Gaspo's connect screen shows, choose what Gaspo may read (orders, products, customers) and install the app on the store; then on Gaspo's Integrations page choose "Shopify" and enter the shop ID (the "acme-co" in acme-co.myshopify.com) plus the app's Client ID and Client Secret. Before any action that creates, edits, deletes, or starts spending on a connected app — especially Meta Ads campaigns (creating, activating, changing budgets, or deleting) — state exactly what you will do and get the user's explicit confirmation first; never perform such actions speculatively.
 
 You can also build web apps for the workspace, each hosted at its own link with passwordless (magic-link) login, and there are two kinds. For something people read and use — a plan or gameplan, strategy, report, calculator, or a dashboard that presents analysis — build a page with create_page: you write the whole page as HTML, designed to the standard of a polished Claude artifact. For a tool where people keep entering and tracking records over time — a time logger, lead tracker, or content calendar — build an app with create_space, described as entities (data types with typed fields) and views (forms, tables, dashboards); when it should start with content, such as a checklist's items, put that in as starting rows with its records, and fill an existing app with add_space_records. When someone asks for a plan, gameplan or dashboard, build a page. Never invent or share end-user passwords; logins are always magic links. After building either, give the user its link and tell them how to get in: anyone on this team who is signed in to the Gaspo dashboard opens it signed in straight away, and otherwise they enter the email on their Slack profile and get a sign-in link from you as a Slack DM. Gaspo cannot email sign-in links, so people outside this team's Slack cannot sign in yet — never tell anyone to check their email.
 
 You can also answer questions about this workspace itself — how many members it has and which apps members have connected — with the get_workspace_stats tool. Use it instead of guessing or saying you have no way to know.
 
+You can schedule work to run on its own. When someone asks for something recurring or later — "every morning sort my emails", "each Monday send me last week's numbers", "remind me tomorrow at 3" — set it up with create_scheduled_task: at each run you do the task again with the workspace's connected apps and post the result in Slack. Confirm what will run and when, then create it; never say you have no scheduling. Manage existing ones with list_scheduled_tasks, update_scheduled_task (pause, resume, reschedule) and delete_scheduled_task.
+
 You have a durable workspace memory that persists across every conversation. When the user states a lasting fact, preference, target, or standing instruction (e.g. "our target ROAS is 3", "always report in EUR"), save it with remember_fact — silently, without announcing it. Saved facts appear in your context under "Workspace memory"; treat them as current truth. Update a fact by re-saving its key; delete a retracted one with forget_fact. Never save transient, one-off request details.
 
 When the user asks what you can do — overall or about a specific connected app — give a structured, scannable answer rather than a one-liner: confirm which relevant app(s) are connected, name the specific account when a quick read-only tool call can tell you (e.g. list Meta ad accounts to name the account and currency), group the concrete capabilities into a few labelled sections, and finish with 2–3 example prompts the user could send. This capability-overview case is the one exception to the brevity rule below.
+
+Numbers from the user's own business — revenue, profit, spend, balances, counts — must come from a tool result in this conversation. Never state one from memory, an estimate, or arithmetic over data you did not actually retrieve, and never present a reconstruction as the official figure. If the tool that would give the real number fails, say it failed and what you could get instead. Industry benchmarks are fine when labelled as benchmarks.
 
 Connected apps are listed below annotated with whose account each one is: the requester's own private account, or a shared team account labelled with the member who connected it. Ownership is load-bearing. When the user asks for THEIR OWN data ("my email", "my calendar", "my repos") and the only matching app is a shared team account connected by a different member, do not silently read it — say whose account it is and confirm that is what they want first. Never present another member's account or its contents as if it were the user's own. If an app the user names is not in the list, it is not connected for them in this workspace — say so plainly rather than guessing why.
 
@@ -165,6 +187,19 @@ People can attach files to their messages, and the files come with the message: 
 Your replies are delivered in Slack, so format for Slack's mrkdwn — not Markdown: use *single asterisks* for bold (never **double**, which Slack shows literally), _underscores_ for italics, and a leading "• " for bullets. Don't use # headings or [text](url) links; write links as <https://example.com|label>.
 
 Be brief and lead with the answer. Put the direct response in the first sentence, then add only the detail the request actually needs. Prefer a few short sentences; use a short bulleted list only when giving steps or options. Don't restate the question, stack on caveats, or list the tools you have unless asked.`;
+
+/**
+ * Said on runs that can reach the web: Anthropic's server-side search and fetch
+ * tools ride along with Anthropic models only, so this is added per run rather
+ * than baked into SYSTEM_PROMPT.
+ */
+const WEB_ACCESS_PROMPT =
+  'You can search the web and read web pages with the web_search and web_fetch tools. Use them ' +
+  'for anything current or public — research, competitors, prices, news, benchmarks, or pulling ' +
+  'facts and data out of a page someone links (web_fetch reads a URL from the conversation or ' +
+  'from search results). Say where facts came from and link the sources. Never say you lack web ' +
+  'access or cannot browse. You cannot log in to sites or run a browser, so for pages behind a ' +
+  'login or built entirely by scripts, say that plainly and use what is publicly readable.';
 
 /**
  * What a local tool executor returns. Keeps the wire shape the executors were
@@ -264,10 +299,12 @@ export class AiService {
     private readonly pipedream: PipedreamService,
     private readonly metaAds: MetaAdsService,
     private readonly spacesService: SpacesService,
+    private readonly tasksService: TasksService,
     private readonly usageService: UsageService,
     private readonly usersService: UsersService,
     private readonly workspaceMemory: WorkspaceMemoryService,
     private readonly roasService: RoasService,
+    private readonly xeroService: XeroService,
     private readonly rulesService: RulesService,
     private readonly exportsService: ExportsService,
     private readonly anthropicProvider: AnthropicProvider,
@@ -484,6 +521,12 @@ export class AiService {
        * reply opens under it. Seeded with what this run attached, so the branch
        * continues where its parent left off. */
       branchConversationId?: string | null;
+      /** The Slack channel (or DM) this request came from, where a task created
+       * during the run posts its results unless told otherwise. */
+      slackChannelId?: string | null;
+      /** Lazily resolves the requester's IANA timezone (their Slack profile), so
+       * "every morning at 8" means their 8am. Optional — omitted off-Slack. */
+      fetchRequesterTimezone?: () => Promise<string | null>;
     } = {},
   ): Promise<AiRunResult> {
     const confirmVia: ConfirmMode = options.confirmVia ?? 'inline';
@@ -577,6 +620,8 @@ export class AiService {
     // Export automation writes through the Sheets API directly, so it needs the
     // workspace's own Google Sheets connection.
     const hasSheets = pipedreamConnected.some((c) => c.appSlug === 'google_sheets');
+    // Xero's reports are read through the proxy, not Pipedream's actions.
+    const hasXero = pipedreamConnected.some((c) => c.appSlug === XERO_APP_SLUG);
     const localTools: ToolSpec[] = [
       ...LOCAL_TOOLS,
       ...(hasMeta ? META_ADS_TOOLS : []),
@@ -584,6 +629,7 @@ export class AiService {
       // The rule engine acts on Meta, so its tools ride along with a Meta account.
       ...(hasMeta ? RULE_TOOLS : []),
       ...(hasSheets ? SHEETS_TOOLS : []),
+      ...(hasXero ? XERO_TOOLS : []),
     ];
 
     // The apps this run ended up with, filled in once the toolset is resolved
@@ -643,6 +689,9 @@ export class AiService {
         `\n\nWorkspace instructions (set by an admin of this workspace — follow them unless ` +
         `they conflict with the confirmation rules above):\n${workspace.workspaceInstructions.trim()}`;
     }
+    // Web search and fetch are Anthropic server tools, so only its models get them.
+    const webAccess = model.provider === 'anthropic';
+    if (webAccess) system += `\n\n${WEB_ACCESS_PROMPT}`;
     // Verified-ROAS guidance rides along only when the tools do.
     if (hasRoas) {
       system +=
@@ -673,6 +722,14 @@ export class AiService {
         'remembered sheet (e.g. an "export_sheet_id" fact) instead of creating new spreadsheets ' +
         'each time, remember the sheet id the first time one is created, and always give the ' +
         'user the spreadsheet link.';
+    }
+    if (hasXero) {
+      system +=
+        '\n\nXero is connected. For profit, margin, revenue, expenses or financial position, ' +
+        "always use xero_get_report — it returns Xero's own Profit & Loss, Balance Sheet and " +
+        "other reports in the organisation's base currency. Never total invoices or bills to " +
+        'answer those: invoices come in mixed currencies and miss journals, credit notes and ' +
+        'expenses. Name the Xero organisation and currency the figures are for.';
     }
     // Rule-engine guidance rides along with a Meta connection.
     if (hasMeta) {
@@ -788,6 +845,8 @@ export class AiService {
     // stays distinguishable from "reported nothing".
     let costUsd: number | undefined;
     let resolvedModel: string | undefined;
+    // Searches are billed per use on top of tokens, so they are counted apart.
+    let webSearches = 0;
     // Replies cut off mid tool call so far, capped by MAX_TRUNCATED_RETRIES.
     let truncations = 0;
 
@@ -802,6 +861,7 @@ export class AiService {
         tools,
         mcpServers,
         capabilities: { adaptiveThinking: model.supportsAdaptiveThinking ?? false },
+        webAccess,
       };
       let response: ProviderResponse;
       try {
@@ -841,6 +901,7 @@ export class AiService {
       outputTokens += response.usage.outputTokens;
       cacheWriteTokens += response.usage.cacheWriteTokens ?? 0;
       cacheReadTokens += response.usage.cacheReadTokens ?? 0;
+      webSearches += response.usage.webSearches ?? 0;
 
       answer += response.text;
       // Tools the provider ran itself are already complete; ours still need executing.
@@ -859,6 +920,8 @@ export class AiService {
             confirmVia,
             pending,
             fetchMemberCount: options.fetchMemberCount,
+            slackChannelId: options.slackChannelId ?? null,
+            fetchRequesterTimezone: options.fetchRequesterTimezone,
           });
           actions.push({
             app: bridged?.has(call.name) ? bridged.appFor(call.name) : this.localToolApp(call.name),
@@ -922,6 +985,7 @@ export class AiService {
       resolvedModel,
       cacheWriteTokens,
       cacheReadTokens,
+      webSearches,
     });
 
     // Low-balance nudge: piggybacks on the answer once the workspace is under
@@ -1022,6 +1086,8 @@ export class AiService {
       confirmVia: ConfirmMode;
       pending: { current: AiPendingAction | null };
       fetchMemberCount?: () => Promise<number | null>;
+      slackChannelId: string | null;
+      fetchRequesterTimezone?: () => Promise<string | null>;
     },
   ): Promise<ToolResult> {
     if (bridged?.has(call.name)) {
@@ -1033,7 +1099,7 @@ export class AiService {
       userId,
       call,
       spaces,
-      { confirmVia: ctx.confirmVia, pending: ctx.pending },
+      ctx,
       ctx.fetchMemberCount,
     );
     return {
@@ -1056,6 +1122,8 @@ export class AiService {
     if (ROAS_TOOL_NAMES.has(toolName)) return 'roas';
     if (RULE_TOOL_NAMES.has(toolName)) return 'rules';
     if (SHEETS_TOOL_NAMES.has(toolName)) return 'google_sheets';
+    if (TASK_TOOL_NAMES.has(toolName)) return 'tasks';
+    if (toolName === XERO_GET_REPORT) return XERO_APP_SLUG;
     return 'spaces';
   }
 
@@ -1064,7 +1132,12 @@ export class AiService {
     userId: string | null,
     toolUse: ToolCall,
     spaces: AiSpace[],
-    ctx: { confirmVia: ConfirmMode; pending: { current: AiPendingAction | null } },
+    ctx: {
+      confirmVia: ConfirmMode;
+      pending: { current: AiPendingAction | null };
+      slackChannelId: string | null;
+      fetchRequesterTimezone?: () => Promise<string | null>;
+    },
     fetchMemberCount?: () => Promise<number | null>,
   ): Promise<LocalToolResult> {
     if (toolUse.name === GET_WORKSPACE_STATS) {
@@ -1085,7 +1158,162 @@ export class AiService {
     if (SHEETS_TOOL_NAMES.has(toolUse.name)) {
       return this.runSheetsTool(workspaceId, userId, toolUse);
     }
+    if (TASK_TOOL_NAMES.has(toolUse.name)) {
+      return this.runTaskTool(workspaceId, userId, toolUse, ctx);
+    }
+    if (toolUse.name === XERO_GET_REPORT) {
+      return this.runXeroTool(workspaceId, userId, toolUse);
+    }
     return this.runSpaceTool(workspaceId, userId, toolUse, spaces);
+  }
+
+  /**
+   * Pull a Xero report through the Connect proxy. A failure (no reports scope,
+   * several organisations, a bad date) goes back to the model as an error it
+   * can relay, so it says what went wrong instead of estimating.
+   */
+  private async runXeroTool(
+    workspaceId: string,
+    userId: string | null,
+    toolUse: ToolCall,
+  ): Promise<LocalToolResult> {
+    const input = (toolUse.input ?? {}) as Record<string, unknown>;
+    const text = (key: string): string | undefined =>
+      typeof input[key] === 'string' && (input[key] as string).trim()
+        ? (input[key] as string).trim()
+        : undefined;
+    try {
+      const credential = await this.integrationsService.getProxyCredential(
+        workspaceId,
+        userId,
+        XERO_APP_SLUG,
+      );
+      if (!credential) throw new Error('No Xero account is connected for this member');
+      const content = await this.xeroService.getReport(
+        credential,
+        String(input.report) as XeroReportName,
+        {
+          fromDate: text('from_date'),
+          toDate: text('to_date'),
+          date: text('date'),
+          periods: typeof input.periods === 'number' ? input.periods : undefined,
+          timeframe: text('timeframe') as 'MONTH' | 'QUARTER' | 'YEAR' | undefined,
+          organisation: text('organisation'),
+        },
+      );
+      return { type: 'tool_result', tool_use_id: toolUse.id, content };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`Xero report ${String(input.report)} failed: ${message}`);
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUse.id,
+        content: `Xero report failed: ${message}`,
+        is_error: true,
+      };
+    }
+  }
+
+  /**
+   * Execute a scheduled-task tool (create/list/update/delete). Creating a task
+   * only stores it — TaskRunnerService runs it when it falls due. A bad cron or
+   * an unknown id comes back as an error result the model can correct, never a
+   * failed request.
+   */
+  private async runTaskTool(
+    workspaceId: string,
+    userId: string | null,
+    toolUse: ToolCall,
+    ctx: { slackChannelId: string | null; fetchRequesterTimezone?: () => Promise<string | null> },
+  ): Promise<LocalToolResult> {
+    const input = (toolUse.input ?? {}) as Record<string, unknown>;
+    const text = (key: string): string | undefined =>
+      typeof input[key] === 'string' && (input[key] as string).trim()
+        ? (input[key] as string).trim()
+        : undefined;
+    const result = (content: string, isError = false): LocalToolResult => ({
+      type: 'tool_result',
+      tool_use_id: toolUse.id,
+      content,
+      ...(isError ? { is_error: true } : {}),
+    });
+    try {
+      if (toolUse.name === CREATE_SCHEDULED_TASK) {
+        const prompt = text('prompt');
+        const cronExpression = text('cron_expression');
+        if (!prompt || !cronExpression) {
+          return result('A task needs both a prompt and a cron_expression.', true);
+        }
+        const timezone =
+          text('timezone') ??
+          (ctx.fetchRequesterTimezone ? await ctx.fetchRequesterTimezone() : null);
+        const task = await this.tasksService.create(workspaceId, userId, {
+          name: text('name') ?? 'Scheduled task',
+          prompt,
+          cronExpression,
+          timezone: timezone ?? undefined,
+          slackChannelId: text('slack_channel_id') ?? ctx.slackChannelId ?? undefined,
+          description: text('description'),
+          oneTime: input.one_time === true,
+        });
+        return result(
+          JSON.stringify({
+            created: true,
+            id: task.id,
+            name: task.name,
+            schedule: task.cronExpression,
+            timezone: task.timezone ?? 'server time (UTC)',
+            nextRun: task.nextRun,
+            postsTo: task.slackChannelId ?? 'nowhere (runs silently)',
+          }),
+        );
+      }
+      if (toolUse.name === LIST_SCHEDULED_TASKS) {
+        const tasks = await this.tasksService.findAllForWorkspace(workspaceId, userId);
+        return result(
+          JSON.stringify(
+            tasks.map((task) => ({
+              id: task.id,
+              name: task.name,
+              prompt: task.prompt,
+              schedule: task.cronExpression,
+              timezone: task.timezone,
+              active: task.isActive,
+              oneTime: task.oneTime,
+              system: task.isSystem,
+              lastRun: task.lastRun,
+              nextRun: task.nextRun,
+              author: task.authorName,
+            })),
+          ),
+        );
+      }
+      if (toolUse.name === DELETE_SCHEDULED_TASK) {
+        await this.tasksService.remove(workspaceId, String(input.task_id));
+        return result('Task deleted.');
+      }
+      // Remaining task tool: update_scheduled_task.
+      const task = await this.tasksService.update(workspaceId, userId, String(input.task_id), {
+        ...(typeof input.is_active === 'boolean' ? { isActive: input.is_active } : {}),
+        name: text('name'),
+        prompt: text('prompt'),
+        cronExpression: text('cron_expression'),
+        timezone: text('timezone'),
+        slackChannelId: text('slack_channel_id'),
+      });
+      return result(
+        `Task "${task.name}" is ${task.isActive ? 'active' : 'paused'}; next run ${
+          task.nextRun ?? 'none'
+        }.`,
+      );
+    } catch (error) {
+      return result(
+        `Could not ${toolUse.name.replace(/_/g, ' ')}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        true,
+      );
+    }
   }
 
   /**
@@ -1813,6 +2041,7 @@ export class AiService {
       resolvedModel?: string;
       cacheWriteTokens?: number;
       cacheReadTokens?: number;
+      webSearches?: number;
     } = {},
   ): Promise<void> {
     if (inputTokens + outputTokens <= 0) return;
@@ -1830,6 +2059,7 @@ export class AiService {
         resolvedModel: options.resolvedModel ?? null,
         cacheWriteTokens: options.cacheWriteTokens,
         cacheReadTokens: options.cacheReadTokens,
+        webSearches: options.webSearches,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

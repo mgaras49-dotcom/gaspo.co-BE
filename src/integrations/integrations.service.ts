@@ -535,11 +535,24 @@ export class IntegrationsService {
    *
    * Returns null when no Google Sheets account is connected.
    */
-  async getGoogleSheetsCredential(
+  getGoogleSheetsCredential(
     workspaceId: string,
     userId: string | null,
   ): Promise<SheetsCredential | null> {
-    const connections = await this.visibleAppConnections(workspaceId, userId, 'google_sheets');
+    return this.getProxyCredential(workspaceId, userId, 'google_sheets');
+  }
+
+  /**
+   * The member's connection to a Pipedream app, addressed for the Connect proxy
+   * (external user id plus account id), team accounts first. Null when the app
+   * is not connected.
+   */
+  async getProxyCredential(
+    workspaceId: string,
+    userId: string | null,
+    appSlug: string,
+  ): Promise<{ externalUserId: string; accountId: string } | null> {
+    const connections = await this.visibleAppConnections(workspaceId, userId, appSlug);
     const connection = connections.find((row) => row.externalAccountId);
     if (!connection) return null;
     return {
