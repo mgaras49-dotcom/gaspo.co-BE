@@ -474,6 +474,30 @@ export class SlackService {
     return this.fetchUserProfile(slackUserId, botToken);
   }
 
+  /**
+   * A member's IANA timezone from their Slack settings, or null when Slack
+   * does not say or the call fails. Used to schedule tasks in the requester's
+   * own time rather than the server's.
+   */
+  async getUserTimezone(botToken: string, slackUserId: string): Promise<string | null> {
+    try {
+      const response = await firstValueFrom(
+        this.httpService.get<SlackUserInfoResponse>(`${SLACK_API_BASE_URL}/users.info`, {
+          params: { user: slackUserId },
+          headers: { Authorization: `Bearer ${botToken}` },
+        }),
+      );
+      return (response.data.ok && response.data.user?.tz) || null;
+    } catch (error) {
+      this.logger.warn(
+        `Failed to fetch Slack timezone for ${slackUserId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return null;
+    }
+  }
+
   private async fetchUserProfile(
     slackUserId: string,
     botToken: string | null,

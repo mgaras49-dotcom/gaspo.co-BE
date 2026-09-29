@@ -24,7 +24,7 @@ import { SkillsModule } from './skills/skills.module';
 import { SlackModule } from './slack/slack.module';
 import { SpacesModule } from './spaces/spaces.module';
 import { SuperAdminModule } from './super-admin/super-admin.module';
-import { TasksModule } from './tasks/tasks.module';
+import { TaskRunnerModule } from './tasks/task-runner.module';
 import { UsageModule } from './usage/usage.module';
 import { UsersModule } from './users/users.module';
 import { WorkspacesModule } from './workspaces/workspaces.module';
@@ -47,7 +47,7 @@ import { WorkspacesModule } from './workspaces/workspaces.module';
     IntegrationsModule,
     SkillsModule,
     SpacesModule,
-    TasksModule,
+    TaskRunnerModule,
     AiModule,
     SlackModule,
     RulesSchedulerModule,

@@ -200,6 +200,7 @@ export class SlackEventsService {
         );
       }
 
+      const senderId = message.user;
       const result = await this.aiService.run(workspace.id, member?.id ?? null, prompt, {
         sourceName: 'slack',
         history,
@@ -214,6 +215,12 @@ export class SlackEventsService {
         // Resolved lazily — only the workspace-stats tool needs it, so we avoid
         // a users.list call on every ordinary message.
         fetchMemberCount: () => this.slackService.countMembers(botToken),
+        // A task set up from this message posts back to the same channel or DM,
+        // on the sender's own clock.
+        slackChannelId: channel,
+        fetchRequesterTimezone: senderId
+          ? () => this.slackService.getUserTimezone(botToken, senderId)
+          : undefined,
       });
 
       const answer = result.answer || "I couldn't come up with a response to that.";

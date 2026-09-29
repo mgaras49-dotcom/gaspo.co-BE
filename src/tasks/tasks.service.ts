@@ -2,17 +2,13 @@ import {
   BadRequestException,
   ForbiddenException,
   Injectable,
-  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { CronExpressionParser } from 'cron-parser';
 import { Repository } from 'typeorm';
-import { AiService } from '../ai/ai.service';
 import { TaskType } from '../common/enums';
 import { ScheduledTask } from '../database/entities';
-import { SlackService } from '../slack/slack.service';
-import { WorkspacesService } from '../workspaces/workspaces.service';
 import { CreateTaskDto, UpdateTaskDto } from './dto';
 
 /** Name of the per-workspace SYSTEM task that drives proactive check-ins. */
@@ -53,23 +49,22 @@ export interface TaskView {
 }
 
 /**
- * CRUD and execution for scheduled (and one-time) tasks. A task runs its prompt
- * through {@link AiService} on its cron schedule; the actual ticking is driven
- * by TasksScheduler, which calls {@link runDueTasks} once a minute.
+ * The store for scheduled (and one-time) tasks: create, edit, pause and delete
+ * them, and work out when each fires next. Running them is TaskRunnerService's
+ * job; this service has no AI dependency, so AiService can use it to manage
+ * tasks from chat.
  */
 @Injectable()
 export class TasksService {
-  private readonly logger = new Logger(TasksService.name);
-
   constructor(
     @InjectRepository(ScheduledTask)
     private readonly taskRepository: Repository<ScheduledTask>,
-    private readonly aiService: AiService,
-    private readonly slackService: SlackService,
-    private readonly workspacesService: WorkspacesService,
   ) {}
 
-  async findAllForWorkspace(workspaceId: string, currentUserId: string): Promise<TaskView[]> {
+  async findAllForWorkspace(
+    workspaceId: string,
+    currentUserId: string | null,
+  ): Promise<TaskView[]> {
     const tasks = await this.taskRepository.find({
       where: { workspaceId },
       relations: { createdBy: true },
@@ -78,7 +73,7 @@ export class TasksService {
     return tasks.map((task) => this.toView(task, currentUserId));
   }
 
-  async create(workspaceId: string, userId: string, dto: CreateTaskDto): Promise<TaskView> {
+  async create(workspaceId: string, userId: string | null, dto: CreateTaskDto): Promise<TaskView> {
     const timezone = dto.timezone ?? null;
     const nextRun = this.nextRunFrom(dto.cronExpression, timezone);
     const task = this.taskRepository.create({
@@ -102,7 +97,7 @@ export class TasksService {
 
   async update(
     workspaceId: string,
-    userId: string,
+    userId: string | null,
     id: string,
     dto: UpdateTaskDto,
   ): Promise<TaskView> {
@@ -130,73 +125,6 @@ export class TasksService {
     const task = await this.findOwned(workspaceId, id);
     await this.taskRepository.remove(task);
     return { success: true };
-  }
-
-  /** Run a task immediately, regardless of its schedule. */
-  async runNow(workspaceId: string, id: string, currentUserId: string): Promise<TaskView> {
-    const task = await this.taskRepository.findOne({ where: { id, workspaceId } });
-    if (!task) throw new NotFoundException('Task not found');
-    await this.executeTask(task);
-    return this.findOneView(workspaceId, id, currentUserId);
-  }
-
-  /**
-   * Execute every active task that is due, called on each scheduler tick. Tasks
-   * run sequentially; one failure never blocks the rest.
-   */
-  async runDueTasks(now: Date = new Date()): Promise<void> {
-    const due = await this.taskRepository
-      .createQueryBuilder('task')
-      .where('task.isActive = :active', { active: true })
-      .andWhere('task.nextRun IS NOT NULL')
-      .andWhere('task.nextRun <= :now', { now })
-      .getMany();
-
-    for (const task of due) {
-      await this.executeTask(task).catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : String(error);
-        this.logger.error(`Scheduled task ${task.id} (${task.name}) failed: ${message}`);
-      });
-    }
-  }
-
-  /** Run one task's prompt, deliver its answer to Slack, and advance its schedule. */
-  private async executeTask(task: ScheduledTask): Promise<void> {
-    this.logger.log(`Running task ${task.id} (${task.name})`);
-    try {
-      const result = await this.aiService.run(task.workspaceId, task.createdByUserId, task.prompt, {
-        model: task.model,
-        taskId: task.id,
-        sourceName: `task:${task.name}`,
-      });
-      await this.deliver(task, result.answer);
-    } finally {
-      task.lastRun = new Date();
-      if (task.oneTime) {
-        task.isActive = false;
-        task.nextRun = null;
-      } else {
-        task.nextRun = this.nextRunFrom(task.cronExpression, task.timezone);
-      }
-      await this.taskRepository.save(task);
-    }
-  }
-
-  /**
-   * Post a task's answer to its configured Slack destination. Best-effort: a
-   * task with no destination (or an empty answer) simply runs silently, and a
-   * missing bot token is logged rather than thrown so the schedule still advances.
-   */
-  private async deliver(task: ScheduledTask, answer: string): Promise<void> {
-    const text = answer?.trim();
-    if (!task.slackChannelId || !text) return;
-
-    const workspace = await this.workspacesService.findById(task.workspaceId);
-    if (!workspace?.slackBotToken) {
-      this.logger.warn(`Task ${task.id} (${task.name}) has no Slack bot token to deliver with`);
-      return;
-    }
-    await this.slackService.deliver(workspace.slackBotToken, task.slackChannelId, text);
   }
 
   /**
@@ -246,10 +174,10 @@ export class TasksService {
     return task;
   }
 
-  private async findOneView(
+  async findOneView(
     workspaceId: string,
     id: string,
-    currentUserId: string,
+    currentUserId: string | null,
   ): Promise<TaskView> {
     const task = await this.taskRepository.findOne({
       where: { id, workspaceId },
@@ -263,7 +191,7 @@ export class TasksService {
    * Compute the next fire time for a cron expression, interpreting its fields in
    * the given timezone (server-local when null). Validates the expression.
    */
-  private nextRunFrom(cronExpression: string, timezone: string | null): Date {
+  nextRunFrom(cronExpression: string, timezone: string | null): Date {
     try {
       return CronExpressionParser.parse(cronExpression, {
         tz: timezone ?? undefined,
@@ -275,7 +203,7 @@ export class TasksService {
     }
   }
 
-  private toView(task: ScheduledTask, currentUserId: string): TaskView {
+  private toView(task: ScheduledTask, currentUserId: string | null): TaskView {
     return {
       id: task.id,
       name: task.name,
@@ -292,7 +220,7 @@ export class TasksService {
       nextRun: task.nextRun ? task.nextRun.toISOString() : null,
       createdAt: task.createdAt.toISOString(),
       authorName: task.createdBy ? task.createdBy.name : null,
-      authorIsCurrentUser: task.createdByUserId === currentUserId,
+      authorIsCurrentUser: currentUserId !== null && task.createdByUserId === currentUserId,
     };
   }
 }

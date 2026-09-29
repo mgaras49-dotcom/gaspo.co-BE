@@ -77,13 +77,26 @@ export const CREDITS_PER_DOLLAR = 400;
 export const CREDIT_MARGIN = 1;
 
 /**
+ * Anthropic's price for one web search: $10 per 1,000, on top of the tokens its
+ * results add. Web fetch has no per-use fee, only tokens. Charged to the
+ * workspace at the same margin as tokens.
+ */
+export const WEB_SEARCH_PRICE_USD = 0.01;
+
+/** Credits charged for a run's web searches. */
+export function webSearchCredits(searches: number): number {
+  return Math.max(0, searches) * WEB_SEARCH_PRICE_USD * CREDITS_PER_DOLLAR * CREDIT_MARGIN;
+}
+
+/**
  * Anthropic models, priced from Anthropic's published rates. Every one supports
  * tool use, the server-side MCP connector, and prompt caching.
  *
- * Deliberately just two: Sonnet 5 for everyday work and Opus 4.8 for when a
- * workspace wants the stronger model. Offering the whole Anthropic line-up made
- * the picker a quiz with no right answer, and the older Opus and Sonnet
- * generations cost the same as their current ones while performing worse.
+ * Deliberately short: Sonnet 5 for everyday work and Opus 5.5 for when a
+ * workspace wants the strongest model. Opus 4.8 stays only so workspaces and
+ * tasks that already pinned it keep resolving. Offering the whole Anthropic
+ * line-up made the picker a quiz with no right answer, and the older Opus and
+ * Sonnet generations cost as much as the current ones while performing worse.
  */
 const ANTHROPIC_MODELS: ModelDefinition[] = [
   {
@@ -103,17 +116,31 @@ const ANTHROPIC_MODELS: ModelDefinition[] = [
     badges: [{ type: 'recommended' }, { type: 'discount', value: '−40%' }],
   },
   {
+    id: 'claude-opus-5-5',
+    name: 'Claude Opus 5.5',
+    description:
+      'The strongest model, for complex research, analysis and multi-step work. Costs about a ' +
+      'third more than Sonnet 5.',
+    provider: 'anthropic',
+    inputPricePerMillion: 4,
+    outputPricePerMillion: 20,
+    supportsTools: true,
+    supportsRemoteMcp: true,
+    supportsAdaptiveThinking: true,
+    badges: [{ type: 'premium', value: '+33%' }],
+  },
+  {
     id: 'claude-opus-4-8',
     name: 'Claude Opus 4.8',
     description:
-      'The stronger model, for complex or high-stakes campaign work. Costs about two-thirds more than Sonnet 5.',
+      'The previous Opus, kept for workspaces already using it. Opus 5.5 is stronger and cheaper.',
     provider: 'anthropic',
     inputPricePerMillion: 5,
     outputPricePerMillion: 25,
     supportsTools: true,
     supportsRemoteMcp: true,
     supportsAdaptiveThinking: true,
-    badges: [{ type: 'premium', value: '+67%' }],
+    badges: [{ type: 'premium', value: '+67%' }, { type: 'deprecated' }],
   },
 ];
 

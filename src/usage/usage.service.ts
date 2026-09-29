@@ -7,6 +7,8 @@ import {
   buildCatalog,
   creditRates,
   listCostUsd,
+  WEB_SEARCH_PRICE_USD,
+  webSearchCredits,
 } from '../ai/providers/model-catalog';
 import { CreditBucket, CreditEventType, CreditGrantReason } from '../common/enums';
 import { AppConfig } from '../config/configuration';
@@ -143,6 +145,8 @@ export interface RecordUsageInput {
    */
   cacheWriteTokens?: number;
   cacheReadTokens?: number;
+  /** Web searches the run made, billed per search on top of its tokens. */
+  webSearches?: number;
   /** Human label for what spent the credits, e.g. an app or feature name. */
   sourceName: string;
   type?: CreditEventType;
@@ -340,11 +344,14 @@ export class UsageService {
     );
   }
 
-  /** Credits charged for a run's tokens, minimum 1 per metered event. */
-  private creditsFor(model: string, inputTokens: number, outputTokens: number): number {
-    const definition = this.definitionFor(model);
+  /** Credits charged for a run's tokens and web searches, minimum 1 per metered event. */
+  private creditsFor(input: RecordUsageInput): number {
+    const definition = this.definitionFor(input.model);
     const rates = definition ? creditRates(definition) : UNKNOWN_MODEL_RATES;
-    const credits = (inputTokens / 1000) * rates.input + (outputTokens / 1000) * rates.output;
+    const credits =
+      (input.inputTokens / 1000) * rates.input +
+      (input.outputTokens / 1000) * rates.output +
+      webSearchCredits(input.webSearches ?? 0);
     return Math.max(1, Math.ceil(credits));
   }
 
@@ -359,12 +366,13 @@ export class UsageService {
       return input.providerCostUsd;
     }
     const definition = this.definitionFor(input.model);
+    const searches = Math.max(0, input.webSearches ?? 0) * WEB_SEARCH_PRICE_USD;
     return definition
       ? listCostUsd(definition, input.inputTokens, input.outputTokens, {
           cacheWriteTokens: input.cacheWriteTokens,
           cacheReadTokens: input.cacheReadTokens,
-        })
-      : 0;
+        }) + searches
+      : searches;
   }
 
   /**
@@ -388,7 +396,7 @@ export class UsageService {
       cacheReadTokens: input.cacheReadTokens ?? 0,
       // Kept as the sum so the analytics queries below stay a single column read.
       tokensUsed: input.inputTokens + input.outputTokens,
-      creditsUsed: this.creditsFor(input.model, input.inputTokens, input.outputTokens),
+      creditsUsed: this.creditsFor(input),
       model: input.model,
       resolvedModel: input.resolvedModel ?? null,
       // numeric columns round-trip as strings in pg; fix the scale here so the

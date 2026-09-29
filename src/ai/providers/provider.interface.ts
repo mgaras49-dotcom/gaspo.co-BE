@@ -84,6 +84,12 @@ export interface ProviderRequest {
    * have to pattern-match on model ids to know what the API will accept.
    */
   capabilities: { adaptiveThinking: boolean };
+  /**
+   * Let the model search the web and read pages. Anthropic runs both itself as
+   * server tools; other adapters ignore it. Set only on the agent loop — a
+   * routing call has no use for the web and would pay for the tool schemas.
+   */
+  webAccess?: boolean;
 }
 
 /**
@@ -121,6 +127,8 @@ export interface ProviderResponse {
      */
     cacheWriteTokens?: number;
     cacheReadTokens?: number;
+    /** Web searches the provider ran this call, billed per search on top of tokens. */
+    webSearches?: number;
     /**
      * What the provider says this call actually cost us, in USD. Only gateways
      * that report a per-response cost set this; when absent the cost is derived
