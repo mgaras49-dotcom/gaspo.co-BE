@@ -24,8 +24,8 @@ export const CREATE_PDF_TOOL: ToolSpec = {
     'headings, paragraphs, - bullets, 1. numbered lists, | tables | with a header divider row, ' +
     '**bold**, *italic*, [links](https://…) and --- rules. It is laid out as a clean A4 document ' +
     'with the title on top and page numbers. Use it whenever someone wants a PDF or a file to send ' +
-    'or attach. Put the link in your reply; to attach it to an email, pass the link to the email ' +
-    "app's attachment-by-URL field.",
+    'or attach. Put the link in your reply; to attach it to an email, pass the link as the ' +
+    "email app's attachment URL (Gmail: `attachments` plus `attachmentFilenames`).",
   parameters: {
     type: 'object',
     properties: {
