@@ -45,6 +45,13 @@ import { TasksService } from '../tasks/tasks.service';
 import { validationReasons } from '../spaces/spec/validate-spec';
 import { CREDITS_PER_DOLLAR, UsageService } from '../usage/usage.service';
 import { UsersService } from '../users/users.service';
+import { GeneratedFilesService, safeFileName } from '../files/generated-files.service';
+import {
+  IMAGE_ASPECT_RATIOS,
+  ImageAspectRatio,
+  ImageGenerationService,
+} from '../files/image-generation.service';
+import { renderPdf } from '../files/pdf-render';
 import {
   META_ADS_CREATE_AD,
   META_ADS_CREATE_AD_CREATIVE,
@@ -103,6 +110,7 @@ import {
 } from './task-tools';
 import { GET_WORKSPACE_STATS, WORKSPACE_TOOLS } from './workspace-tools';
 import { XERO_GET_REPORT, XERO_TOOLS } from './xero-tools';
+import { CREATE_PDF, CREATE_PDF_TOOL, FILE_TOOL_NAMES, GENERATE_IMAGE_TOOL } from './file-tools';
 
 /**
  * Balance under which replies carry a top-up nudge: $10 of credits.
@@ -162,6 +170,7 @@ const LOCAL_TOOLS: ToolSpec[] = [
   ...WORKSPACE_TOOLS,
   ...MEMORY_TOOLS,
   ...TASK_TOOLS,
+  CREATE_PDF_TOOL,
 ];
 
 const SYSTEM_PROMPT = `You are Gaspo, an AI assistant for a workspace. You can take actions across the user's connected apps using the available tools. Prefer acting over describing: when a request maps to a tool, use it. When you lack a connected app needed for a request, say so plainly and name the app to connect. Shopify is the one app that cannot connect in one click: Shopify only admits outside tools through a custom app the store owner creates. If asked how to connect it, walk them through it — in the Shopify Dev Dashboard create an app, paste in the redirect URL Gaspo's connect screen shows, choose what Gaspo may read (orders, products, customers) and install the app on the store; then on Gaspo's Integrations page choose "Shopify" and enter the shop ID (the "acme-co" in acme-co.myshopify.com) plus the app's Client ID and Client Secret. Before any action that creates, edits, deletes, or starts spending on a connected app — especially Meta Ads campaigns (creating, activating, changing budgets, or deleting) — state exactly what you will do and get the user's explicit confirmation first; never perform such actions speculatively.
@@ -171,6 +180,8 @@ You can also build web apps for the workspace, each hosted at its own link with 
 You can also answer questions about this workspace itself — how many members it has and which apps members have connected — with the get_workspace_stats tool. Use it instead of guessing or saying you have no way to know.
 
 You can schedule work to run on its own. When someone asks for something recurring or later — "every morning sort my emails", "each Monday send me last week's numbers", "remind me tomorrow at 3" — set it up with create_scheduled_task: at each run you do the task again with the workspace's connected apps and post the result in Slack. Confirm what will run and when, then create it; never say you have no scheduling. Manage existing ones with list_scheduled_tasks, update_scheduled_task (pause, resume, reschedule) and delete_scheduled_task.
+
+You can make PDF files with create_pdf: reports, strategies, proposals, one-pagers — anything someone wants as a document to download, send or attach. Write the full content, then share the link it returns. To attach one to an email, pass that link to the email app's attachment field (attachment by URL). Never say you cannot make PDFs or offer a .txt file instead.
 
 You have a durable workspace memory that persists across every conversation. When the user states a lasting fact, preference, target, or standing instruction (e.g. "our target ROAS is 3", "always report in EUR"), save it with remember_fact — silently, without announcing it. Saved facts appear in your context under "Workspace memory"; treat them as current truth. Update a fact by re-saving its key; delete a retracted one with forget_fact. Never save transient, one-off request details.
 
@@ -201,6 +212,14 @@ const WEB_ACCESS_PROMPT =
   'access or cannot browse. You cannot log in to sites or run a browser, so for pages behind a ' +
   'login or built entirely by scripts, say that plainly and use what is publicly readable.';
 
+/** Said on runs that can make images, i.e. when an image provider is configured. */
+const IMAGE_PROMPT =
+  'You can create images with generate_image — ad creatives, product shots, social posts, ' +
+  'thumbnails, illustrations — and edit or restyle pictures the user attached (set ' +
+  'use_attached_images). Never say you cannot make images. The image appears under your reply ' +
+  'in Slack by itself, so just say what you made in a line; for several variations, call the ' +
+  'tool once per image.';
+
 /**
  * What a local tool executor returns. Keeps the wire shape the executors were
  * written against so the provider refactor did not have to touch forty return
@@ -225,6 +244,13 @@ export interface AiAction {
   app: string;
   tool: string;
   isError: boolean;
+}
+
+/** A file Gaspo made during a run (PDF, image), surfaced so the chat can show it. */
+export interface AiFile {
+  name: string;
+  mimetype: string;
+  url: string;
 }
 
 /** A Space created during a run, surfaced so the chat can link to it. */
@@ -255,6 +281,8 @@ export interface AiRunResult {
   actions: AiAction[];
   /** Spaces Gaspo built during this run. */
   spaces: AiSpace[];
+  /** Files Gaspo made during this run, e.g. images to show under the reply. */
+  files: AiFile[];
   /** A write awaiting the user's button approval, when in interactive mode. */
   pendingAction: AiPendingAction | null;
 }
@@ -313,6 +341,8 @@ export class AiService {
     private readonly toolRouter: ToolRouterService,
     private readonly attachedApps: AttachedAppsService,
     private readonly workspacesService: WorkspacesService,
+    private readonly generatedFiles: GeneratedFilesService,
+    private readonly imageGeneration: ImageGenerationService,
   ) {}
 
   getStatus(): { module: string; ready: boolean; providers: string[] } {
@@ -551,6 +581,7 @@ export class AiService {
         connectedApps: [],
         actions: [],
         spaces: [],
+        files: [],
         pendingAction: null,
       };
     }
@@ -630,6 +661,9 @@ export class AiService {
       ...(hasMeta ? RULE_TOOLS : []),
       ...(hasSheets ? SHEETS_TOOLS : []),
       ...(hasXero ? XERO_TOOLS : []),
+      // Offered only when a provider is configured, so without one the model
+      // says it cannot make images instead of calling a tool that always fails.
+      ...(this.imageGeneration.isConfigured() ? [GENERATE_IMAGE_TOOL] : []),
     ];
 
     // The apps this run ended up with, filled in once the toolset is resolved
@@ -692,6 +726,7 @@ export class AiService {
     // Web search and fetch are Anthropic server tools, so only its models get them.
     const webAccess = model.provider === 'anthropic';
     if (webAccess) system += `\n\n${WEB_ACCESS_PROMPT}`;
+    if (this.imageGeneration.isConfigured()) system += `\n\n${IMAGE_PROMPT}`;
     // Verified-ROAS guidance rides along only when the tools do.
     if (hasRoas) {
       system +=
@@ -832,6 +867,15 @@ export class AiService {
     ];
     const actions: AiAction[] = [];
     const spaces: AiSpace[] = [];
+    const files: AiFile[] = [];
+    // Images generated this run, billed per image on top of tokens.
+    const imageCost = { usd: 0 };
+    // Pictures the image tool can work from: this message's first, then the
+    // thread's, newest first.
+    const referenceImages = [
+      ...(options.attachments ?? []),
+      ...[...(options.history ?? [])].reverse().flatMap((turn) => turn.attachments ?? []),
+    ].filter((attachment) => attachment.kind === 'image');
     // In button mode, the first Meta write the model proposes is captured here
     // (rather than executed) so the surface can request approval out of band.
     const pending: { current: AiPendingAction | null } = { current: null };
@@ -922,6 +966,9 @@ export class AiService {
             fetchMemberCount: options.fetchMemberCount,
             slackChannelId: options.slackChannelId ?? null,
             fetchRequesterTimezone: options.fetchRequesterTimezone,
+            files,
+            referenceImages,
+            imageCost,
           });
           actions.push({
             app: bridged?.has(call.name) ? bridged.appFor(call.name) : this.localToolApp(call.name),
@@ -986,6 +1033,7 @@ export class AiService {
       cacheWriteTokens,
       cacheReadTokens,
       webSearches,
+      imageCostUsd: imageCost.usd,
     });
 
     // Low-balance nudge: piggybacks on the answer once the workspace is under
@@ -1007,6 +1055,7 @@ export class AiService {
       connectedApps: appsAvailable ? appSlugs : [],
       actions,
       spaces,
+      files,
       pendingAction: pending.current,
     };
   }
@@ -1066,7 +1115,7 @@ export class AiService {
    */
   private configurationProblem(answer: string): AiRunResult {
     this.logger.warn(`Refusing an AI run: ${answer}`);
-    return { answer, connectedApps: [], actions: [], spaces: [], pendingAction: null };
+    return { answer, connectedApps: [], actions: [], spaces: [], files: [], pendingAction: null };
   }
 
   /**
@@ -1088,6 +1137,9 @@ export class AiService {
       fetchMemberCount?: () => Promise<number | null>;
       slackChannelId: string | null;
       fetchRequesterTimezone?: () => Promise<string | null>;
+      files: AiFile[];
+      referenceImages: Attachment[];
+      imageCost: { usd: number };
     },
   ): Promise<ToolResult> {
     if (bridged?.has(call.name)) {
@@ -1124,6 +1176,7 @@ export class AiService {
     if (SHEETS_TOOL_NAMES.has(toolName)) return 'google_sheets';
     if (TASK_TOOL_NAMES.has(toolName)) return 'tasks';
     if (toolName === XERO_GET_REPORT) return XERO_APP_SLUG;
+    if (FILE_TOOL_NAMES.has(toolName)) return 'files';
     return 'spaces';
   }
 
@@ -1137,6 +1190,9 @@ export class AiService {
       pending: { current: AiPendingAction | null };
       slackChannelId: string | null;
       fetchRequesterTimezone?: () => Promise<string | null>;
+      files: AiFile[];
+      referenceImages: Attachment[];
+      imageCost: { usd: number };
     },
     fetchMemberCount?: () => Promise<number | null>,
   ): Promise<LocalToolResult> {
@@ -1164,7 +1220,109 @@ export class AiService {
     if (toolUse.name === XERO_GET_REPORT) {
       return this.runXeroTool(workspaceId, userId, toolUse);
     }
+    if (FILE_TOOL_NAMES.has(toolUse.name)) {
+      return this.runFileTool(workspaceId, userId, toolUse, ctx);
+    }
     return this.runSpaceTool(workspaceId, userId, toolUse, spaces);
+  }
+
+  /**
+   * Make a file (a PDF from written content, or a generated image), store it,
+   * and hand the model its link. Images are also collected on the run so Slack
+   * can show them under the reply. A failure goes back as an error result the
+   * model can explain, never a failed request.
+   */
+  private async runFileTool(
+    workspaceId: string,
+    userId: string | null,
+    toolUse: ToolCall,
+    ctx: { files: AiFile[]; referenceImages: Attachment[]; imageCost: { usd: number } },
+  ): Promise<LocalToolResult> {
+    const input = (toolUse.input ?? {}) as Record<string, unknown>;
+    const text = (key: string): string | undefined =>
+      typeof input[key] === 'string' && (input[key] as string).trim()
+        ? (input[key] as string).trim()
+        : undefined;
+    const result = (content: string, isError = false): LocalToolResult => ({
+      type: 'tool_result',
+      tool_use_id: toolUse.id,
+      content,
+      ...(isError ? { is_error: true } : {}),
+    });
+    try {
+      if (toolUse.name === CREATE_PDF) {
+        const title = text('title');
+        const content = text('content');
+        if (!title || !content) return result('A PDF needs a title and content.', true);
+        const bytes = await renderPdf({ title, subtitle: text('subtitle'), body: content });
+        const file = await this.generatedFiles.save({
+          workspaceId,
+          userId,
+          name: safeFileName(text('file_name') ?? title, 'pdf'),
+          mimetype: 'application/pdf',
+          data: bytes,
+        });
+        ctx.files.push({ name: file.name, mimetype: file.mimetype, url: file.url });
+        return result(
+          JSON.stringify({
+            created: true,
+            name: file.name,
+            url: file.url,
+            sizeKb: Math.round(file.size / 1024),
+            note: 'Share this link in your reply. Anyone with the link can download the PDF.',
+          }),
+        );
+      }
+      // Remaining file tool: generate_image.
+      const prompt = text('prompt');
+      if (!prompt) return result('An image needs a prompt.', true);
+      const ratio = text('aspect_ratio');
+      const aspectRatio: ImageAspectRatio = (IMAGE_ASPECT_RATIOS as readonly string[]).includes(
+        ratio ?? '',
+      )
+        ? (ratio as ImageAspectRatio)
+        : '1:1';
+      const references =
+        input.use_attached_images === true
+          ? ctx.referenceImages
+              .slice(0, 3)
+              .flatMap((image) =>
+                image.kind === 'image' ? [{ mediaType: image.mediaType, data: image.data }] : [],
+              )
+          : [];
+      if (input.use_attached_images === true && !references.length) {
+        return result(
+          'No images are attached in this conversation. Ask the user to attach the picture, or ' +
+            'generate from the prompt alone.',
+          true,
+        );
+      }
+      const image = await this.imageGeneration.generate({ prompt, aspectRatio, references });
+      ctx.imageCost.usd += image.costUsd;
+      const extension = image.mimetype.split('/')[1]?.replace('jpeg', 'jpg') || 'png';
+      const file = await this.generatedFiles.save({
+        workspaceId,
+        userId,
+        name: safeFileName(text('file_name') ?? prompt.slice(0, 60), extension),
+        mimetype: image.mimetype,
+        data: image.bytes,
+      });
+      ctx.files.push({ name: file.name, mimetype: file.mimetype, url: file.url });
+      return result(
+        JSON.stringify({
+          created: true,
+          name: file.name,
+          url: file.url,
+          note:
+            'The image is shown under your reply in Slack automatically — do not paste the link ' +
+            'as an image. Mention the link only if they need it elsewhere (an email, an ad).',
+        }),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`${toolUse.name} failed: ${message}`);
+      return result(`Could not ${toolUse.name.replace(/_/g, ' ')}: ${message}`, true);
+    }
   }
 
   /**
@@ -2042,6 +2200,7 @@ export class AiService {
       cacheWriteTokens?: number;
       cacheReadTokens?: number;
       webSearches?: number;
+      imageCostUsd?: number;
     } = {},
   ): Promise<void> {
     if (inputTokens + outputTokens <= 0) return;
@@ -2060,6 +2219,7 @@ export class AiService {
         cacheWriteTokens: options.cacheWriteTokens,
         cacheReadTokens: options.cacheReadTokens,
         webSearches: options.webSearches,
+        imageCostUsd: options.imageCostUsd,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

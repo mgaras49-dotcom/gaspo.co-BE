@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository, SelectQueryBuilder } from 'typeorm';
 import {
+  CREDIT_MARGIN,
   CREDITS_PER_DOLLAR,
   buildCatalog,
   creditRates,
@@ -147,6 +148,8 @@ export interface RecordUsageInput {
   cacheReadTokens?: number;
   /** Web searches the run made, billed per search on top of its tokens. */
   webSearches?: number;
+  /** What the images the run generated cost, in USD, billed on top of its tokens. */
+  imageCostUsd?: number;
   /** Human label for what spent the credits, e.g. an app or feature name. */
   sourceName: string;
   type?: CreditEventType;
@@ -351,7 +354,8 @@ export class UsageService {
     const credits =
       (input.inputTokens / 1000) * rates.input +
       (input.outputTokens / 1000) * rates.output +
-      webSearchCredits(input.webSearches ?? 0);
+      webSearchCredits(input.webSearches ?? 0) +
+      Math.max(0, input.imageCostUsd ?? 0) * CREDITS_PER_DOLLAR * CREDIT_MARGIN;
     return Math.max(1, Math.ceil(credits));
   }
 
@@ -362,17 +366,19 @@ export class UsageService {
    * recording nothing is better than inventing a number.
    */
   private costUsdFor(input: RecordUsageInput): number {
+    // Images are paid to a separate provider, so no model provider's figure includes them.
+    const images = Math.max(0, input.imageCostUsd ?? 0);
     if (input.providerCostUsd !== undefined && Number.isFinite(input.providerCostUsd)) {
-      return input.providerCostUsd;
+      return input.providerCostUsd + images;
     }
     const definition = this.definitionFor(input.model);
-    const searches = Math.max(0, input.webSearches ?? 0) * WEB_SEARCH_PRICE_USD;
+    const extras = Math.max(0, input.webSearches ?? 0) * WEB_SEARCH_PRICE_USD + images;
     return definition
       ? listCostUsd(definition, input.inputTokens, input.outputTokens, {
           cacheWriteTokens: input.cacheWriteTokens,
           cacheReadTokens: input.cacheReadTokens,
-        }) + searches
-      : searches;
+        }) + extras
+      : extras;
   }
 
   /**

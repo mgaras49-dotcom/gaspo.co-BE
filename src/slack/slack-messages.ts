@@ -131,3 +131,25 @@ export function buildResolvedBlocks(text: string, footer: string): SlackBlock[] 
     { type: 'context', elements: [{ type: 'mrkdwn', text: footer }] },
   ];
 }
+
+/** Image types Slack's image block will render. */
+const SLACK_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/gif']);
+
+/**
+ * Image blocks for pictures Gaspo generated, shown under its reply. Slack
+ * fetches each `url` itself, so it must be publicly reachable; files of other
+ * types (PDFs) are linked in the reply text instead and are skipped here.
+ */
+export function buildImageBlocks(
+  files: Array<{ name: string; mimetype: string; url: string }>,
+): SlackBlock[] {
+  return files
+    .filter((file) => SLACK_IMAGE_TYPES.has(file.mimetype))
+    .slice(0, 10)
+    .map((file) => ({
+      type: 'image',
+      image_url: file.url,
+      alt_text: file.name.slice(0, 2000),
+      title: { type: 'plain_text', text: file.name.slice(0, 2000), emoji: false },
+    }));
+}

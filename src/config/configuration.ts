@@ -7,6 +7,13 @@ export interface AppConfig {
     nodeEnv: string;
     port: number;
     frontendUrl: string;
+    /**
+     * Where this API is reachable from the internet, for links that point at it
+     * directly (generated files). Production serves the API under `/api` on the
+     * frontend's domain, so that is the default; set PUBLIC_API_URL locally,
+     * e.g. to the ngrok tunnel, so Slack can fetch the file.
+     */
+    publicApiUrl: string;
   };
   database: {
     host: string;
@@ -82,6 +89,18 @@ export interface AppConfig {
      */
     gatewayModels: string;
   };
+  images: {
+    /**
+     * Google AI Studio key for Gemini image generation ("Nano Banana"). Takes
+     * precedence over OpenAI when both are set. With neither, Gaspo is not
+     * offered the image tool and says it cannot make images.
+     */
+    geminiApiKey: string;
+    geminiModel: string;
+    /** OpenAI key for gpt-image generation, used when no Gemini key is set. */
+    openaiApiKey: string;
+    openaiModel: string;
+  };
   billing: {
     /** The platform's own Stripe secret key (top-ups) — NOT a customer's. */
     stripeSecretKey: string;
@@ -122,6 +141,9 @@ export const configuration = (): AppConfig => ({
     nodeEnv: process.env.NODE_ENV ?? 'development',
     port: parseInt(process.env.PORT ?? '3000', 10),
     frontendUrl: process.env.FRONTEND_URL ?? 'http://localhost:5173',
+    publicApiUrl:
+      process.env.PUBLIC_API_URL ||
+      `${(process.env.FRONTEND_URL ?? 'http://localhost:5173').replace(/\/$/, '')}/api`,
   },
   database: {
     host: process.env.DATABASE_HOST ?? 'localhost',
@@ -173,6 +195,12 @@ export const configuration = (): AppConfig => ({
     gatewayBaseUrl: process.env.AI_GATEWAY_BASE_URL ?? '',
     gatewayApiKey: process.env.AI_GATEWAY_API_KEY ?? '',
     gatewayModels: process.env.AI_GATEWAY_MODELS ?? '',
+  },
+  images: {
+    geminiApiKey: process.env.GEMINI_API_KEY ?? '',
+    geminiModel: process.env.GEMINI_IMAGE_MODEL || 'gemini-2.5-flash-image',
+    openaiApiKey: process.env.OPENAI_API_KEY ?? '',
+    openaiModel: process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1',
   },
   billing: {
     stripeSecretKey: process.env.STRIPE_SECRET_KEY ?? '',
