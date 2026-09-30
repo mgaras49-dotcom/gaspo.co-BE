@@ -268,6 +268,8 @@ export class SlackEventsService {
       } else {
         await this.slackService.postMessage(botToken, channel, answer, threadTs);
       }
+      // Generated images show under the reply; PDFs are linked in its text.
+      await this.slackService.postImages(botToken, channel, result.files, threadTs);
     } catch (error) {
       this.logger.error(
         `Failed to handle Slack message: ${error instanceof Error ? error.message : String(error)}`,

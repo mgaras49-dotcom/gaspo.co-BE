@@ -1,7 +1,7 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { AiService } from '../ai/ai.service';
+import { AiFile, AiService } from '../ai/ai.service';
 import { ScheduledTask } from '../database/entities';
 import { SlackService } from '../slack/slack.service';
 import { WorkspacesService } from '../workspaces/workspaces.service';
@@ -63,7 +63,7 @@ export class TaskRunnerService {
         taskId: task.id,
         sourceName: `task:${task.name}`,
       });
-      await this.deliver(task, result.answer);
+      await this.deliver(task, result.answer, result.files);
     } finally {
       task.lastRun = new Date();
       if (task.oneTime) {
@@ -81,7 +81,7 @@ export class TaskRunnerService {
    * task with no destination (or an empty answer) simply runs silently, and a
    * missing bot token is logged rather than thrown so the schedule still advances.
    */
-  private async deliver(task: ScheduledTask, answer: string): Promise<void> {
+  private async deliver(task: ScheduledTask, answer: string, files: AiFile[]): Promise<void> {
     const text = answer?.trim();
     if (!task.slackChannelId || !text) return;
 
@@ -90,6 +90,6 @@ export class TaskRunnerService {
       this.logger.warn(`Task ${task.id} (${task.name}) has no Slack bot token to deliver with`);
       return;
     }
-    await this.slackService.deliver(workspace.slackBotToken, task.slackChannelId, text);
+    await this.slackService.deliver(workspace.slackBotToken, task.slackChannelId, text, files);
   }
 }

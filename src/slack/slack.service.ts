@@ -13,6 +13,7 @@ import {
   SlackUserInfoResponse,
   SlackUserLookupResponse,
 } from './interfaces/slack-oauth.interface';
+import { buildImageBlocks } from './slack-messages';
 
 /** A shared file's bytes, or why they could not be fetched. */
 export type SlackFileDownload =
@@ -203,12 +204,41 @@ export class SlackService {
    * case. Used for proactive posts (scheduled tasks, onboarding). Best-effort:
    * returns the new message timestamp or null.
    */
-  async deliver(botToken: string, destination: string, text: string): Promise<string | null> {
+  async deliver(
+    botToken: string,
+    destination: string,
+    text: string,
+    files: Array<{ name: string; mimetype: string; url: string }> = [],
+  ): Promise<string | null> {
     const channel = /^[UW]/.test(destination)
       ? await this.openDm(botToken, destination)
       : destination;
     if (!channel) return null;
-    return this.postMessage(botToken, channel, text);
+    const ts = await this.postMessage(botToken, channel, text);
+    await this.postImages(botToken, channel, files);
+    return ts;
+  }
+
+  /**
+   * Show images Gaspo generated, as a follow-up message under its reply. Slack
+   * downloads each image itself, and rejects the whole message when it cannot
+   * (e.g. a local API with no public URL), so that case falls back to links.
+   * Does nothing when none of the files is an image.
+   */
+  async postImages(
+    botToken: string,
+    channel: string,
+    files: Array<{ name: string; mimetype: string; url: string }>,
+    threadTs?: string,
+  ): Promise<void> {
+    const blocks = buildImageBlocks(files);
+    if (!blocks.length) return;
+    const fallback = files
+      .filter((file) => file.mimetype.startsWith('image/'))
+      .map((file) => `<${file.url}|${file.name.replace(/[<>|&]/g, ' ')}>`)
+      .join('\n');
+    const ts = await this.postMessage(botToken, channel, fallback, threadTs, blocks);
+    if (!ts) await this.postMessage(botToken, channel, fallback, threadTs);
   }
 
   /**
