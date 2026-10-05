@@ -1,7 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { AiService } from '../ai/ai.service';
-import { MAX_ATTACHMENT_BYTES, MAX_RUN_ATTACHMENT_BYTES } from '../ai/attachments';
+import { Attachment, MAX_ATTACHMENT_BYTES, MAX_RUN_ATTACHMENT_BYTES } from '../ai/attachments';
 import { MessageRole, UserRole } from '../common/enums';
+import { MessageAttachmentRef, Workspace } from '../database/entities';
 import { MessagesService } from '../memory/messages.service';
 import { UsersService } from '../users/users.service';
 import { WorkspacesService } from '../workspaces/workspaces.service';
@@ -18,6 +19,7 @@ import {
   loadAttachments,
   resolveHistory,
 } from './slack-attachments';
+import { ConversationQueue } from './conversation-queue';
 import { buildApprovalBlocks, buildWelcomeMessage } from './slack-messages';
 import { SlackInteractionsService } from './slack-interactions.service';
 import { SlackService } from './slack.service';
@@ -28,6 +30,28 @@ import { SlackService } from './slack.service';
  * workspace spinner (e.g. 'loading') if one is installed.
  */
 const PROCESSING_REACTION = 'hourglass_flowing_sand';
+
+/**
+ * How long a message waits for the next one from the same person before it
+ * runs. Long enough to catch a follow-up typed straight after ("or Wozniak?"),
+ * short enough not to read as lag.
+ */
+const BURST_SETTLE_MS = 2000;
+
+/** The most a steady stream of messages can hold back the first one. */
+const BURST_MAX_WAIT_MS = 8000;
+
+/** A message accepted for answering, with what resolving it already found. */
+interface QueuedMessage {
+  message: SlackMessageEvent;
+  text: string;
+  files: NonNullable<SlackMessageEvent['files']>;
+  teamId: string;
+  channel: string;
+  workspace: Workspace;
+  memoryThreadId: string | undefined;
+  branchThreadId: string | null;
+}
 
 /**
  * Which conversation a message belongs to, and which one branches off it. Both
@@ -78,6 +102,13 @@ export class SlackEventsService {
   /** Recently handled Slack event ids, to drop duplicate deliveries/retries. */
   private readonly seenEventIds = new Set<string>();
 
+  /** Folds a sender's quick messages in one conversation into one run. */
+  private readonly queue = new ConversationQueue<QueuedMessage>(
+    BURST_SETTLE_MS,
+    BURST_MAX_WAIT_MS,
+    (_key, batch) => this.answer(batch),
+  );
+
   constructor(
     private readonly slackService: SlackService,
     private readonly workspacesService: WorkspacesService,
@@ -119,32 +150,56 @@ export class SlackEventsService {
       this.logger.warn(`No workspace/bot token for Slack team ${teamId}`);
       return;
     }
-    const botToken = workspace.slackBotToken;
-    // Reply in the same thread for mentions; DMs have no parent to thread under.
-    const threadTs = message.thread_ts ?? message.ts;
-    const messageTs = message.ts;
     const { memoryThreadId, branchThreadId } = conversationKeys(message, channel);
 
     // Signal "processing" by reacting to the user's own message rather than
-    // posting a placeholder reply; the reaction is cleared once we answer.
-    if (messageTs) {
-      await this.slackService.addReaction(botToken, channel, messageTs, PROCESSING_REACTION);
+    // posting a placeholder reply; the reaction is cleared once we answer. It
+    // goes on at once, so a message held back to join a burst still shows as
+    // received.
+    if (message.ts) {
+      await this.slackService.addReaction(
+        workspace.slackBotToken,
+        channel,
+        message.ts,
+        PROCESSING_REACTION,
+      );
     }
 
+    // One sender's messages in one conversation are answered together and in
+    // order; see ConversationQueue.
+    this.queue.push(
+      [teamId, channel, memoryThreadId ?? message.ts ?? '', message.user ?? ''].join(':'),
+      { message, text, files, teamId, channel, workspace, memoryThreadId, branchThreadId },
+    );
+  }
+
+  /**
+   * Answer a batch of one sender's messages in one conversation with a single
+   * run. The reply threads under the latest message, which is where the
+   * conversation continues.
+   */
+  private async answer(batch: QueuedMessage[]): Promise<void> {
+    const last = batch[batch.length - 1];
+    const { teamId, channel, workspace, memoryThreadId, branchThreadId } = last;
+    const botToken = workspace.slackBotToken as string;
+    // Reply in the same thread for mentions; DMs have no parent to thread under.
+    const threadTs = last.message.thread_ts ?? last.message.ts;
+
     try {
-      let member = message.user
-        ? await this.usersService.findBySlackIdentity(workspace.id, message.user)
+      const sender = last.message.user;
+      let member = sender
+        ? await this.usersService.findBySlackIdentity(workspace.id, sender)
         : null;
       // A sender with no member row yet (they messaged before ever signing in)
       // is provisioned from their Slack profile, so the run knows who is asking
       // and their private connections resolve — otherwise they would silently
       // run as an anonymous member seeing only shared team accounts.
-      if (!member && message.user) {
+      if (!member && sender) {
         try {
-          const profile = await this.slackService.getUserProfile(botToken, message.user);
+          const profile = await this.slackService.getUserProfile(botToken, sender);
           member = await this.usersService.upsertFromSlack({
             workspaceId: workspace.id,
-            slackUserId: message.user,
+            slackUserId: sender,
             name: profile.name,
             email: profile.email,
             avatarUrl: profile.avatarUrl,
@@ -153,7 +208,7 @@ export class SlackEventsService {
           });
         } catch (error) {
           this.logger.warn(
-            `Could not provision Slack sender ${message.user}: ${
+            `Could not provision Slack sender ${sender}: ${
               error instanceof Error ? error.message : String(error)
             }`,
           );
@@ -161,24 +216,32 @@ export class SlackEventsService {
       }
 
       // Files are fetched now, with the bot token, and again whenever a later
-      // turn replays this one. This message's files are served first, then the
+      // turn replays this one. This batch's files are served first, then the
       // history's newest-first, out of one budget sized to what a request holds.
       const download: FileDownloader = (ref) =>
         this.slackService.downloadFile(botToken, ref.url, MAX_ATTACHMENT_BYTES, ref.mimetype);
       const budget: AttachmentBudget = { remaining: MAX_RUN_ATTACHMENT_BYTES };
-      const refs = files.map(attachmentRef);
-      const current = await loadAttachments(
-        refs.flatMap((ref) => (ref.ok ? [ref.ref] : [])),
-        download,
-        budget,
-      );
-      const prompt = composePrompt(
-        text,
-        current.loaded.map((ref) => ref.name),
-        [...refs.flatMap((ref) => (ref.ok ? [] : [ref.problem])), ...current.problems],
-      );
+      const turns: Array<{ prompt: string; loaded: MessageAttachmentRef[] }> = [];
+      const attachments: Attachment[] = [];
+      for (const item of batch) {
+        const refs = item.files.map(attachmentRef);
+        const current = await loadAttachments(
+          refs.flatMap((ref) => (ref.ok ? [ref.ref] : [])),
+          download,
+          budget,
+        );
+        turns.push({
+          prompt: composePrompt(
+            item.text,
+            current.loaded.map((ref) => ref.name),
+            [...refs.flatMap((ref) => (ref.ok ? [] : [ref.problem])), ...current.problems],
+          ),
+          loaded: current.loaded,
+        });
+        attachments.push(...current.attachments);
+      }
 
-      // Load prior turns BEFORE persisting this one, so the new prompt isn't
+      // Load prior turns BEFORE persisting these, so the new prompt isn't
       // duplicated in its own history. Both calls are best-effort inside
       // MessagesService — memory never blocks a reply.
       const history = memoryThreadId
@@ -190,38 +253,44 @@ export class SlackEventsService {
         : [];
       for (const threadId of [memoryThreadId, branchThreadId]) {
         if (!threadId) continue;
-        await this.messagesService.appendTurn(
-          workspace.id,
-          threadId,
-          member?.id ?? null,
-          MessageRole.USER,
-          prompt,
-          current.loaded,
-        );
+        for (const turn of turns) {
+          await this.messagesService.appendTurn(
+            workspace.id,
+            threadId,
+            member?.id ?? null,
+            MessageRole.USER,
+            turn.prompt,
+            turn.loaded,
+          );
+        }
       }
 
-      const senderId = message.user;
-      const result = await this.aiService.run(workspace.id, member?.id ?? null, prompt, {
-        sourceName: 'slack',
-        history,
-        attachments: current.attachments,
-        // Same key as the conversation memory: connected apps stay attached for
-        // the life of a thread rather than being re-decided per message.
-        conversationId: memoryThreadId,
-        branchConversationId: branchThreadId,
-        // Slack can approve gated writes with interactive buttons, so defer them
-        // out of band rather than using the soft `confirmed` flag.
-        confirmVia: 'buttons',
-        // Resolved lazily — only the workspace-stats tool needs it, so we avoid
-        // a users.list call on every ordinary message.
-        fetchMemberCount: () => this.slackService.countMembers(botToken),
-        // A task set up from this message posts back to the same channel or DM,
-        // on the sender's own clock.
-        slackChannelId: channel,
-        fetchRequesterTimezone: senderId
-          ? () => this.slackService.getUserTimezone(botToken, senderId)
-          : undefined,
-      });
+      const result = await this.aiService.run(
+        workspace.id,
+        member?.id ?? null,
+        turns.map((turn) => turn.prompt).join('\n\n'),
+        {
+          sourceName: 'slack',
+          history,
+          attachments,
+          // Same key as the conversation memory: connected apps stay attached for
+          // the life of a thread rather than being re-decided per message.
+          conversationId: memoryThreadId,
+          branchConversationId: branchThreadId,
+          // Slack can approve gated writes with interactive buttons, so defer them
+          // out of band rather than using the soft `confirmed` flag.
+          confirmVia: 'buttons',
+          // Resolved lazily — only the workspace-stats tool needs it, so we avoid
+          // a users.list call on every ordinary message.
+          fetchMemberCount: () => this.slackService.countMembers(botToken),
+          // A task set up from this message posts back to the same channel or DM,
+          // on the sender's own clock.
+          slackChannelId: channel,
+          fetchRequesterTimezone: sender
+            ? () => this.slackService.getUserTimezone(botToken, sender)
+            : undefined,
+        },
+      );
 
       const answer = result.answer || "I couldn't come up with a response to that.";
 
@@ -241,11 +310,11 @@ export class SlackEventsService {
       // A gated write is pending: post Gaspo's description with Approve/Cancel
       // buttons and stash the action for the interaction callback. Requires a
       // known requester (to gate who can approve); otherwise fall back to text.
-      if (result.pendingAction && message.user) {
+      if (result.pendingAction && sender) {
         const token = await this.interactions.storePending({
           workspaceId: workspace.id,
           requesterUserId: member?.id ?? null,
-          requesterSlackId: message.user,
+          requesterSlackId: sender,
           requesterName: member?.name ?? 'the requester',
           teamId,
           channel,
@@ -282,8 +351,14 @@ export class SlackEventsService {
       );
     } finally {
       // Clear the processing indicator whether we answered or errored.
-      if (messageTs) {
-        await this.slackService.removeReaction(botToken, channel, messageTs, PROCESSING_REACTION);
+      for (const item of batch) {
+        if (!item.message.ts) continue;
+        await this.slackService.removeReaction(
+          botToken,
+          channel,
+          item.message.ts,
+          PROCESSING_REACTION,
+        );
       }
     }
   }

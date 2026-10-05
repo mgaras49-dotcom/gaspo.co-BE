@@ -545,7 +545,9 @@ export class AiService {
     const need = typeof input.need === 'string' && input.need.trim() ? input.need : app;
     const matched = matchAppServers(app, ctx.servers, ctx.appNames);
     if (!matched.length) {
-      const connected = [...new Set(ctx.servers.map((s) => ctx.appNames.get(s.appSlug) ?? s.appSlug))];
+      const connected = [
+        ...new Set(ctx.servers.map((s) => ctx.appNames.get(s.appSlug) ?? s.appSlug)),
+      ];
       return {
         servers: ctx.attached,
         isError: true,
@@ -582,7 +584,8 @@ export class AiService {
     }
     if (Object.keys(remembered).length) {
       for (const conversationId of ctx.conversationIds) {
-        if (conversationId) await this.attachedApps.merge(ctx.workspaceId, conversationId, remembered);
+        if (conversationId)
+          await this.attachedApps.merge(ctx.workspaceId, conversationId, remembered);
       }
     }
     return {
@@ -1073,11 +1076,19 @@ export class AiService {
               attached: mcpServers,
               appNames: new Map(connected.map((c) => [c.appSlug, c.appName])),
               workspaceId,
-              conversationIds: [options.conversationId ?? null, options.branchConversationId ?? null],
+              conversationIds: [
+                options.conversationId ?? null,
+                options.branchConversationId ?? null,
+              ],
             });
             mcpServers = loaded.servers;
             actions.push({ app: 'apps', tool: call.name, isError: loaded.isError });
-            results.push({ id: call.id, name: call.name, content: loaded.message, isError: loaded.isError });
+            results.push({
+              id: call.id,
+              name: call.name,
+              content: loaded.message,
+              isError: loaded.isError,
+            });
             continue;
           }
           const result = await this.runTool(workspaceId, userId, call, bridged, spaces, {
