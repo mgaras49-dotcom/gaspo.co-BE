@@ -41,6 +41,13 @@ const BURST_SETTLE_MS = 2000;
 /** The most a steady stream of messages can hold back the first one. */
 const BURST_MAX_WAIT_MS = 8000;
 
+/** When a reply still being worked on gets a "still working" note. */
+const STILL_WORKING_AFTER_MS = 60_000;
+
+const STILL_WORKING_MESSAGE = '_Still working on this — it needs a little longer than usual._';
+
+const FAILURE_MESSAGE = '⚠️ Sorry, something went wrong handling that. Please try again.';
+
 /** A message accepted for answering, with what resolving it already found. */
 interface QueuedMessage {
   message: SlackMessageEvent;
@@ -184,6 +191,13 @@ export class SlackEventsService {
     const botToken = workspace.slackBotToken as string;
     // Reply in the same thread for mentions; DMs have no parent to thread under.
     const threadTs = last.message.thread_ts ?? last.message.ts;
+
+    // A long answer gets one word that it is coming. On 30 Sept six messages
+    // sat with no visible reply for most of an hour and one ended "are you
+    // there?" — the hourglass alone did not read as "working on it".
+    const stillWorking = setTimeout(() => {
+      void this.slackService.postMessage(botToken, channel, STILL_WORKING_MESSAGE, threadTs);
+    }, STILL_WORKING_AFTER_MS);
 
     try {
       const sender = last.message.user;
@@ -343,13 +357,22 @@ export class SlackEventsService {
       this.logger.error(
         `Failed to handle Slack message: ${error instanceof Error ? error.message : String(error)}`,
       );
-      await this.slackService.postMessage(
-        botToken,
-        channel,
-        '⚠️ Sorry, something went wrong handling that. Please try again.',
-        threadTs,
-      );
+      await this.slackService.postMessage(botToken, channel, FAILURE_MESSAGE, threadTs);
+      // Kept in the conversation as the user saw it: the next turn knows the
+      // last one failed, and a later look at the history shows the failure
+      // instead of a question that seemingly went unanswered.
+      for (const threadId of [memoryThreadId, branchThreadId]) {
+        if (!threadId) continue;
+        await this.messagesService.appendTurn(
+          workspace.id,
+          threadId,
+          null,
+          MessageRole.ASSISTANT,
+          FAILURE_MESSAGE,
+        );
+      }
     } finally {
+      clearTimeout(stillWorking);
       // Clear the processing indicator whether we answered or errored.
       for (const item of batch) {
         if (!item.message.ts) continue;
