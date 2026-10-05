@@ -175,6 +175,29 @@ const LOCAL_TOOLS: ToolSpec[] = [
   CREATE_PDF_TOOL,
 ];
 
+/**
+ * Actions sent whenever their app is, because nearly every other action of the
+ * app needs what they return and their own descriptions don't say so. Google
+ * Ads' list of reachable accounts is described only as "options for the Account
+ * ID field", so the router never picked it: asked to edit The Business
+ * Builders' account, Gaspo said it had no way to find it and asked Matthew for
+ * the customer ID.
+ */
+const ALWAYS_ATTACHED_ACTIONS: Record<string, string[]> = {
+  google_ads: ['google_ads-list-account-id-options'],
+};
+
+/** A routed action list plus the app's always-attached actions it actually has. */
+export function withAlwaysAttached(
+  appSlug: string,
+  chosen: string[],
+  actions: Array<{ name: string }>,
+): string[] {
+  const available = new Set(actions.map((action) => action.name));
+  const always = (ALWAYS_ATTACHED_ACTIONS[appSlug] ?? []).filter((name) => available.has(name));
+  return [...new Set([...chosen, ...always])];
+}
+
 const SYSTEM_PROMPT = `You are Gaspo, an AI assistant for a workspace. You can take actions across the user's connected apps using the available tools. Prefer acting over describing: when a request maps to a tool, use it. When you lack a connected app needed for a request, say so plainly and name the app to connect. Shopify is the one app that cannot connect in one click: Shopify only admits outside tools through a custom app the store owner creates. If asked how to connect it, walk them through it — in the Shopify Dev Dashboard create an app, paste in the redirect URL Gaspo's connect screen shows, choose what Gaspo may read (orders, products, customers) and install the app on the store; then on Gaspo's Integrations page choose "Shopify" and enter the shop ID (the "acme-co" in acme-co.myshopify.com) plus the app's Client ID and Client Secret. Before any action that creates, edits, deletes, or starts spending on a connected app — especially Meta Ads campaigns (creating, activating, changing budgets, or deleting) — state exactly what you will do and get the user's explicit confirmation first; never perform such actions speculatively.
 
 You can also build web apps for the workspace, each hosted at its own link with passwordless (magic-link) login, and there are two kinds. For something people read and use — a plan or gameplan, strategy, report, calculator, or a dashboard that presents analysis — build a page with create_page: you write the whole page as HTML, designed to the standard of a polished Claude artifact. For a tool where people keep entering and tracking records over time — a time logger, lead tracker, or content calendar — build an app with create_space, described as entities (data types with typed fields) and views (forms, tables, dashboards); when it should start with content, such as a checklist's items, put that in as starting rows with its records, and fill an existing app with add_space_records. When someone asks for a plan, gameplan or dashboard, build a page. Never invent or share end-user passwords; logins are always magic links. After building either, give the user its link and tell them how to get in: anyone on this team who is signed in to the Gaspo dashboard opens it signed in straight away, and otherwise they enter the email on their Slack profile and get a sign-in link from you as a Slack DM. Gaspo cannot email sign-in links, so people outside this team's Slack cannot sign in yet — never tell anyone to check their email.
@@ -442,11 +465,16 @@ export class AiService {
     const routeActions = (appSlug: string): Promise<string[] | null> => {
       let decision = routed.get(appSlug);
       if (!decision) {
-        decision = this.appActions(appSlug).then((actions) =>
-          actions.length
-            ? this.toolRouter.selectRelevantActions(provider, modelId, prompt, actions)
-            : null,
-        );
+        decision = this.appActions(appSlug).then(async (actions) => {
+          if (!actions.length) return null;
+          const chosen = await this.toolRouter.selectRelevantActions(
+            provider,
+            modelId,
+            prompt,
+            actions,
+          );
+          return chosen ? withAlwaysAttached(appSlug, chosen, actions) : null;
+        });
         routed.set(appSlug, decision);
       }
       return decision;
@@ -597,12 +625,18 @@ export class AiService {
       }
       let decision = routed.get(server.appSlug);
       if (!decision) {
-        decision = this.appActions(server.appSlug).then((actions) =>
-          actions.length
-            ? this.toolRouter.selectRelevantActions(provider, modelId, need, actions)
-            : null,
-        );
-        routed.set(server.appSlug, decision);
+        const appSlug = server.appSlug;
+        decision = this.appActions(appSlug).then(async (actions) => {
+          if (!actions.length) return null;
+          const chosen = await this.toolRouter.selectRelevantActions(
+            provider,
+            modelId,
+            need,
+            actions,
+          );
+          return chosen ? withAlwaysAttached(appSlug, chosen, actions) : null;
+        });
+        routed.set(appSlug, decision);
       }
       const chosen = await decision;
       // Null is the router's "could not narrow" — the app goes whole, as on attach.
