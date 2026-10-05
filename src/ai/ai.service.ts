@@ -15,6 +15,8 @@ import { ToolRouterService } from './providers/tool-router.service';
 import { AttachedApps, AttachedAppsService } from './providers/attached-apps.service';
 import { buildCatalog, ModelDefinition } from './providers/model-catalog';
 import { Attachment } from './attachments';
+import { describeNow } from './clock';
+import { LOAD_APP_TOOLS, LOAD_APP_TOOLS_TOOL, matchAppServers } from './app-loading-tools';
 import {
   AttachmentRejectedError,
   LlmProvider,
@@ -197,7 +199,11 @@ People can attach files to their messages, and the files come with the message: 
 
 Your replies are delivered in Slack, so format for Slack's mrkdwn — not Markdown: use *single asterisks* for bold (never **double**, which Slack shows literally), _underscores_ for italics, and a leading "• " for bullets. Don't use # headings or [text](url) links; write links as <https://example.com|label>.
 
-Be brief and lead with the answer. Put the direct response in the first sentence, then add only the detail the request actually needs. Prefer a few short sentences; use a short bulleted list only when giving steps or options. Don't restate the question, stack on caveats, or list the tools you have unless asked.`;
+Be brief and lead with the answer. Put the direct response in the first sentence, then add only the detail the request actually needs. Prefer a few short sentences; use a short bulleted list only when giving steps or options. Don't restate the question, stack on caveats, or list the tools you have unless asked.
+
+When a request is clear, do it, then report what you did — not what you held back or why. Ask a question only when you truly cannot proceed without the answer, and then ask just one.
+
+Each new message ends with the current date and time for the person asking. Use it for anything time-relative ("today", "last week", "what time is it") and never say you don't know the date or time.`;
 
 /**
  * Said on runs that can reach the web: Anthropic's server-side search and fetch
@@ -517,6 +523,76 @@ export class AiService {
   }
 
   /**
+   * Answer a load_app_tools call: route the named app's actions against what the
+   * model says it needs, add them to the servers for the rest of the run, and
+   * remember them for the conversation so the next turn starts with them too.
+   * Only ever widens — an action already attached stays attached.
+   */
+  private async loadAppTools(
+    provider: LlmProvider,
+    modelId: string,
+    input: Record<string, unknown>,
+    ctx: {
+      servers: RemoteMcpServer[];
+      attached: RemoteMcpServer[];
+      appNames: Map<string, string>;
+      workspaceId: string;
+      /** The conversation and the one branching off it, both of which keep what loads. */
+      conversationIds: Array<string | null>;
+    },
+  ): Promise<{ servers: RemoteMcpServer[]; message: string; isError: boolean }> {
+    const app = typeof input.app === 'string' ? input.app : '';
+    const need = typeof input.need === 'string' && input.need.trim() ? input.need : app;
+    const matched = matchAppServers(app, ctx.servers, ctx.appNames);
+    if (!matched.length) {
+      const connected = [...new Set(ctx.servers.map((s) => ctx.appNames.get(s.appSlug) ?? s.appSlug))];
+      return {
+        servers: ctx.attached,
+        isError: true,
+        message:
+          `No connected app matches "${app}". Connected apps: ${connected.join(', ') || 'none'}. ` +
+          'If the one you need is not among them, tell the user to connect it.',
+      };
+    }
+
+    let servers = [...ctx.attached];
+    const remembered: AttachedApps = {};
+    const loaded: string[] = [];
+    for (const server of matched) {
+      const label = ctx.appNames.get(server.appSlug) ?? server.appSlug;
+      const current = servers.find((s) => s.name === server.name);
+      if (current && !current.enabledTools) {
+        loaded.push(`${label}: every action is already available`);
+        continue;
+      }
+      const actions = await this.appActions(server.appSlug);
+      const chosen = actions.length
+        ? await this.toolRouter.selectRelevantActions(provider, modelId, need, actions)
+        : null;
+      // Null is the router's "could not narrow" — the app goes whole, as on attach.
+      const enabledTools = chosen
+        ? [...new Set([...(current?.enabledTools ?? []), ...chosen])]
+        : undefined;
+      const widened = { ...server, enabledTools };
+      servers = current
+        ? servers.map((s) => (s.name === server.name ? widened : s))
+        : [...servers, widened];
+      remembered[server.name] = enabledTools ?? [];
+      loaded.push(`${label}: ${enabledTools ? enabledTools.join(', ') : 'every action'}`);
+    }
+    if (Object.keys(remembered).length) {
+      for (const conversationId of ctx.conversationIds) {
+        if (conversationId) await this.attachedApps.merge(ctx.workspaceId, conversationId, remembered);
+      }
+    }
+    return {
+      servers,
+      isError: false,
+      message: `Loaded. You can now call these directly — ${loaded.join('; ')}.`,
+    };
+  }
+
+  /**
    * Run a single prompt for a workspace, exposing its connected apps as tools,
    * and return Gaspo's answer plus the actions it took.
    *
@@ -557,9 +633,18 @@ export class AiService {
       /** Lazily resolves the requester's IANA timezone (their Slack profile), so
        * "every morning at 8" means their 8am. Optional — omitted off-Slack. */
       fetchRequesterTimezone?: () => Promise<string | null>;
+      /** A known IANA timezone for the run (a scheduled task's), used for the
+       * date and time the model is told when there is no Slack requester. */
+      timezone?: string | null;
     } = {},
   ): Promise<AiRunResult> {
     const confirmVia: ConfirmMode = options.confirmVia ?? 'inline';
+    // One lookup per run, shared by the clock below and any task created in it.
+    let timezoneLookup: Promise<string | null> | undefined;
+    const resolveTimezone = (): Promise<string | null> =>
+      (timezoneLookup ??= options.timezone
+        ? Promise.resolve(options.timezone)
+        : (options.fetchRequesterTimezone?.().catch(() => null) ?? Promise.resolve(null)));
     const ai = this.configService.get('ai', { infer: true });
     const appUrl = this.configService.get('app', { infer: true }).frontendUrl;
     const billingUrl = `${appUrl}/dashboard/billing`;
@@ -664,6 +749,9 @@ export class AiService {
       // Offered only when a provider is configured, so without one the model
       // says it cannot make images instead of calling a tool that always fails.
       ...(this.imageGeneration.isConfigured() ? [GENERATE_IMAGE_TOOL] : []),
+      // Server-side MCP is the path that narrows apps to a few actions, so it is
+      // the one that needs a way to widen them again mid-run.
+      ...(model.supportsRemoteMcp && servers.length ? [LOAD_APP_TOOLS_TOOL] : []),
     ];
 
     // The apps this run ended up with, filled in once the toolset is resolved
@@ -695,6 +783,12 @@ export class AiService {
           .map((line) => `• ${line}`)
           .join('\n')}`
       : `${SYSTEM_PROMPT}\n\nNo apps are connected in this workspace yet.`;
+    if (localTools.some((tool) => tool.name === LOAD_APP_TOOLS)) {
+      system +=
+        "\n\nEach connected app comes with only the actions this message seemed to need. If you need one you don't " +
+        'have, or an app above has no tools here, call load_app_tools and carry on. Never say a connected app ' +
+        'cannot do something before calling it.';
+    }
     // Tell the model who it is serving, so the ownership annotations above have
     // a referent. An unmatched Slack sender is flagged explicitly: their private
     // connections are unreachable, and the model must not paper over that by
@@ -709,6 +803,11 @@ export class AiService {
         `If they ask for personal data or for an app that is missing, tell them to sign in with ` +
         `Slack at <${appUrl}|${appUrl}> so their account and private connections link up.`;
     }
+    // Gaspo's own plans and credits live on the dashboard, not behind a tool, so
+    // without the link "I want to pay for Gaspo" got "not something I can set up".
+    system +=
+      `\n\nGaspo's own plans, credits and billing are on the dashboard at <${billingUrl}|${billingUrl}>. ` +
+      'When someone wants to subscribe, pay for Gaspo, top up or check their credits, give them that link.';
     // Durable workspace facts ride along on every run so the model has standing
     // context (targets, preferences) without a tool call. Best-effort: null on
     // a read failure or an empty memory.
@@ -857,13 +956,21 @@ export class AiService {
     // never tool_use blocks, so there are no dangling tool-result pairs.
     // Files ride on the turn they were attached to, so a follow-up about a
     // document shared three messages ago still has the document.
+    // The clock rides on the new message, not in the system prompt: a timestamp
+    // there would change the cached prefix every minute. It is not stored, so
+    // replayed turns never carry a stale time.
+    const now = describeNow(new Date(), await resolveTimezone());
     const messages: ProviderMessage[] = [
       ...(options.history ?? []).map((turn) =>
         turn.role === 'assistant'
           ? { role: 'assistant' as const, content: turn.content, toolCalls: [] }
           : { role: 'user' as const, content: turn.content, attachments: turn.attachments },
       ),
-      { role: 'user' as const, content: prompt, attachments: options.attachments },
+      {
+        role: 'user' as const,
+        content: `${prompt}\n\n[Current date and time for the person asking: ${now}]`,
+        attachments: options.attachments,
+      },
     ];
     const actions: AiAction[] = [];
     const spaces: AiSpace[] = [];
@@ -960,12 +1067,25 @@ export class AiService {
         });
         const results: ToolResult[] = [];
         for (const call of response.toolCalls) {
+          if (call.name === LOAD_APP_TOOLS) {
+            const loaded = await this.loadAppTools(provider, model.id, call.input, {
+              servers,
+              attached: mcpServers,
+              appNames: new Map(connected.map((c) => [c.appSlug, c.appName])),
+              workspaceId,
+              conversationIds: [options.conversationId ?? null, options.branchConversationId ?? null],
+            });
+            mcpServers = loaded.servers;
+            actions.push({ app: 'apps', tool: call.name, isError: loaded.isError });
+            results.push({ id: call.id, name: call.name, content: loaded.message, isError: loaded.isError });
+            continue;
+          }
           const result = await this.runTool(workspaceId, userId, call, bridged, spaces, {
             confirmVia,
             pending,
             fetchMemberCount: options.fetchMemberCount,
             slackChannelId: options.slackChannelId ?? null,
-            fetchRequesterTimezone: options.fetchRequesterTimezone,
+            fetchRequesterTimezone: resolveTimezone,
             files,
             referenceImages,
             imageCost,
