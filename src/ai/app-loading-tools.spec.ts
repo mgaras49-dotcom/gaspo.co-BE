@@ -56,3 +56,27 @@ test('matchAppServers matches nothing for an app that is not connected', () => {
   assert.deepEqual(matchAppServers('YouTube', servers, names), []);
   assert.deepEqual(matchAppServers('  ', servers, names), []);
 });
+
+const stores: RemoteMcpServer[] = [
+  {
+    ...server('shopify'),
+    name: 'shopify-alnyra',
+    accountLabel: 'Alnyra (alnyra-com.myshopify.com)',
+  },
+  {
+    ...server('shopify'),
+    name: 'shopify-zyntric',
+    accountLabel: 'Zyntric (zyntric-16.myshopify.com)',
+  },
+];
+
+test('matchAppServers narrows to the named account of an app with several', () => {
+  assert.deepEqual(
+    matchAppServers('Shopify', stores, new Map([['shopify', 'Shopify']]), 'zyntric').map(
+      (s) => s.name,
+    ),
+    ['shopify-zyntric'],
+  );
+  assert.equal(matchAppServers('Shopify', stores, new Map(), undefined).length, 2);
+  assert.deepEqual(matchAppServers('Shopify', stores, new Map(), 'Playllo'), []);
+});

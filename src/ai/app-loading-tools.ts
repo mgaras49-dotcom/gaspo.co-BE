@@ -30,6 +30,12 @@ export const LOAD_APP_TOOLS_TOOL: ToolSpec = {
         description:
           'The connected app, by name or id as listed in your instructions, e.g. "Gmail" or "google_ads".',
       },
+      account: {
+        type: 'string',
+        description:
+          "Only when the app has several accounts connected: which one, e.g. a Shopify store's " +
+          'name. Leave it out to load the actions for every account of the app.',
+      },
       need: {
         type: 'string',
         description: 'What you need to do with it, in plain words, e.g. "draft and send a reply".',
@@ -58,6 +64,7 @@ export function matchAppServers(
   reference: string,
   servers: RemoteMcpServer[],
   appNames: Map<string, string>,
+  account?: string,
 ): RemoteMcpServer[] {
   const wanted = normalise(reference);
   if (!wanted) return [];
@@ -66,8 +73,16 @@ export function matchAppServers(
     normalise(appNames.get(server.appSlug) ?? ''),
   ];
   const exact = servers.filter((server) => labels(server).includes(wanted));
-  if (exact.length) return exact;
-  return servers.filter((server) =>
-    labels(server).some((label) => label && (label.includes(wanted) || wanted.includes(label))),
+  const apps = exact.length
+    ? exact
+    : servers.filter((server) =>
+        labels(server).some((label) => label && (label.includes(wanted) || wanted.includes(label))),
+      );
+  const store = normalise(account ?? '');
+  if (!store) return apps;
+  // A named account narrows to the servers pinned to it; an app served whole
+  // has no accounts to choose between, so it stays.
+  return apps.filter(
+    (server) => !server.accountLabel || normalise(server.accountLabel).includes(store),
   );
 }

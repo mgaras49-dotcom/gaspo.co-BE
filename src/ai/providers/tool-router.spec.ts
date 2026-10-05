@@ -176,3 +176,55 @@ void test('selectRelevantActions exposes the app whole when the provider fails',
 void test('selectRelevantActions exposes the app whole on an unparseable answer', async () => {
   assert.equal(await selectActions('I think you want the campaigns one'), null);
 });
+
+const STORES: RemoteMcpServer[] = [
+  { appSlug: 'gmail', name: 'gmail', url: 'https://mcp/gmail' },
+  {
+    appSlug: 'shopify',
+    name: 'shopify-alnyra',
+    url: 'https://mcp/shopify?accountId=apn_1',
+    accountLabel: 'Alnyra (alnyra-com.myshopify.com)',
+    routeId: 'shopify:alnyra',
+  },
+  {
+    appSlug: 'shopify',
+    name: 'shopify-zyntric',
+    url: 'https://mcp/shopify?accountId=apn_2',
+    accountLabel: 'Zyntric (zyntric-16.myshopify.com)',
+    routeId: 'shopify:zyntric',
+  },
+];
+
+void test('selectRelevantServers can attach one store of an app with several', async () => {
+  const selected = await select('["shopify:zyntric"]', STORES);
+  assert.deepEqual(
+    selected?.map((server) => server.name),
+    ['shopify-zyntric'],
+  );
+});
+
+void test('selectRelevantServers reads a bare app id as every account of it', async () => {
+  const selected = await select('["shopify"]', STORES);
+  assert.deepEqual(
+    selected?.map((server) => server.name),
+    ['shopify-alnyra', 'shopify-zyntric'],
+  );
+});
+
+void test('selectRelevantServers shows the router each account by name', async () => {
+  let prompt = '';
+  const provider: LlmProvider = {
+    ...stubProvider('["gmail"]'),
+    create: (request: ProviderRequest) => {
+      const first = request.messages[0];
+      prompt = 'content' in first ? String(first.content) : '';
+      return stubProvider('["gmail"]').create(request);
+    },
+  };
+  await new ToolRouterService().selectRelevantServers(provider, 'm', 'revenue for Zyntric', STORES);
+  assert.match(
+    prompt,
+    /- shopify:zyntric \(shopify — account: Zyntric \(zyntric-16\.myshopify\.com\)\)/,
+  );
+  assert.match(prompt, /- gmail \(gmail\)/);
+});

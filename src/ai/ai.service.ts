@@ -37,7 +37,7 @@ import {
 } from '../integrations/integrations.service';
 import { MetaAdsService } from '../integrations/meta-ads.service';
 import { WorkspaceMemoryService } from '../memory/workspace-memory.service';
-import { PipedreamService } from '../integrations/pipedream.service';
+import { PipedreamAccountTarget, PipedreamService } from '../integrations/pipedream.service';
 import { RoasService } from '../integrations/roas.service';
 import { XeroReportName, XeroService } from '../integrations/xero.service';
 import { ExportsService } from '../exports/exports.service';
@@ -436,6 +436,22 @@ export class AiService {
     }
     if (!chosen.size) return [];
 
+    // Accounts of one app share its catalogue, so its actions are routed once
+    // however many accounts are attached.
+    const routed = new Map<string, Promise<string[] | null>>();
+    const routeActions = (appSlug: string): Promise<string[] | null> => {
+      let decision = routed.get(appSlug);
+      if (!decision) {
+        decision = this.appActions(appSlug).then((actions) =>
+          actions.length
+            ? this.toolRouter.selectRelevantActions(provider, modelId, prompt, actions)
+            : null,
+        );
+        routed.set(appSlug, decision);
+      }
+      return decision;
+    };
+
     const attaching: AttachedApps = {};
     const attached = await Promise.all(
       // Preserve the input order so the same set of apps always renders the same
@@ -452,10 +468,7 @@ export class AiService {
             return { ...server, enabledTools: undefined };
           }
 
-          const actions = await this.appActions(server.appSlug);
-          const enabled = actions.length
-            ? await this.toolRouter.selectRelevantActions(provider, modelId, prompt, actions)
-            : null;
+          const enabled = await routeActions(server.appSlug);
 
           // Null means "expose the app whole" — the fail-open answer for an app
           // too small to route, an unreachable catalogue, or a router error. For
@@ -542,8 +555,19 @@ export class AiService {
     },
   ): Promise<{ servers: RemoteMcpServer[]; message: string; isError: boolean }> {
     const app = typeof input.app === 'string' ? input.app : '';
+    const account = typeof input.account === 'string' ? input.account : undefined;
     const need = typeof input.need === 'string' && input.need.trim() ? input.need : app;
-    const matched = matchAppServers(app, ctx.servers, ctx.appNames);
+    const matched = matchAppServers(app, ctx.servers, ctx.appNames, account);
+    if (!matched.length && account && matchAppServers(app, ctx.servers, ctx.appNames).length) {
+      const accounts = matchAppServers(app, ctx.servers, ctx.appNames)
+        .map((s) => s.accountLabel)
+        .filter(Boolean);
+      return {
+        servers: ctx.attached,
+        isError: true,
+        message: `No ${app} account matches "${account}". Its accounts: ${accounts.join(', ')}.`,
+      };
+    }
     if (!matched.length) {
       const connected = [
         ...new Set(ctx.servers.map((s) => ctx.appNames.get(s.appSlug) ?? s.appSlug)),
@@ -560,17 +584,27 @@ export class AiService {
     let servers = [...ctx.attached];
     const remembered: AttachedApps = {};
     const loaded: string[] = [];
+    // Accounts of one app share its catalogue: route its actions once.
+    const routed = new Map<string, Promise<string[] | null>>();
     for (const server of matched) {
-      const label = ctx.appNames.get(server.appSlug) ?? server.appSlug;
+      const label = [ctx.appNames.get(server.appSlug) ?? server.appSlug, server.accountLabel]
+        .filter(Boolean)
+        .join(' — ');
       const current = servers.find((s) => s.name === server.name);
       if (current && !current.enabledTools) {
         loaded.push(`${label}: every action is already available`);
         continue;
       }
-      const actions = await this.appActions(server.appSlug);
-      const chosen = actions.length
-        ? await this.toolRouter.selectRelevantActions(provider, modelId, need, actions)
-        : null;
+      let decision = routed.get(server.appSlug);
+      if (!decision) {
+        decision = this.appActions(server.appSlug).then((actions) =>
+          actions.length
+            ? this.toolRouter.selectRelevantActions(provider, modelId, need, actions)
+            : null,
+        );
+        routed.set(server.appSlug, decision);
+      }
+      const chosen = await decision;
       // Null is the router's "could not narrow" — the app goes whole, as on attach.
       const enabledTools = chosen
         ? [...new Set([...(current?.enabledTools ?? []), ...chosen])]
@@ -699,23 +733,43 @@ export class AiService {
       await this.integrationsService.findVisibleForUser(workspaceId, userId)
     ).filter((c) => c.isActive);
     const pipedreamConnected = connected.filter((c) => c.provider === 'pipedream');
-    const teamSlugs = [
-      ...new Set(pipedreamConnected.filter((c) => c.accessLevel === 'team').map((c) => c.appSlug)),
-    ];
-    const privateSlugs = userId
-      ? [
-          ...new Set(
-            pipedreamConnected.filter((c) => c.accessLevel === 'private').map((c) => c.appSlug),
-          ),
-        ]
-      : [];
-
+    // One server per app, or per account when a scope holds several accounts of
+    // one app: unpinned, Pipedream picks the account itself, which sent a
+    // question about 33 Shopify stores to whichever one it chose.
+    const serversFor = (externalUserId: string, accounts: ConnectedIntegrationView[]) => {
+      const bySlug = new Map<string, ConnectedIntegrationView[]>();
+      for (const account of accounts) {
+        bySlug.set(account.appSlug, [...(bySlug.get(account.appSlug) ?? []), account]);
+      }
+      const whole: string[] = [];
+      const pinned: PipedreamAccountTarget[] = [];
+      for (const [appSlug, list] of bySlug) {
+        if (list.length < 2 || list.some((account) => !account.externalAccountId)) {
+          whole.push(appSlug);
+          continue;
+        }
+        for (const account of list) {
+          pinned.push({
+            appSlug,
+            accountId: account.externalAccountId as string,
+            label: account.nickname ?? account.accountName ?? (account.externalAccountId as string),
+          });
+        }
+      }
+      return [
+        ...(whole.length ? this.pipedream.buildMcpServers(externalUserId, whole) : []),
+        ...(pinned.length ? this.pipedream.buildAccountMcpServers(externalUserId, pinned) : []),
+      ];
+    };
     const pipedreamServers = [
-      ...(teamSlugs.length ? this.pipedream.buildMcpServers(workspaceId, teamSlugs) : []),
-      ...(privateSlugs.length && userId
-        ? this.pipedream.buildMcpServers(
+      ...serversFor(
+        workspaceId,
+        pipedreamConnected.filter((c) => c.accessLevel === 'team'),
+      ),
+      ...(userId
+        ? serversFor(
             PipedreamService.privateExternalUserId(userId),
-            privateSlugs,
+            pipedreamConnected.filter((c) => c.accessLevel === 'private'),
           )
         : []),
     ];
@@ -726,6 +780,9 @@ export class AiService {
       name: server.name,
       url: server.url,
       authorizationToken: pipedreamToken ?? undefined,
+      ...(server.accountLabel
+        ? { accountLabel: server.accountLabel, routeId: server.routeId }
+        : {}),
     }));
 
     // Meta Ads is NOT exposed as an MCP server: Meta's hosted Ads MCP is
@@ -786,6 +843,17 @@ export class AiService {
           .map((line) => `• ${line}`)
           .join('\n')}`
       : `${SYSTEM_PROMPT}\n\nNo apps are connected in this workspace yet.`;
+    const pinnedServers = servers.filter((server) => server.accountLabel);
+    if (pinnedServers.length) {
+      const appName = (slug: string) => connected.find((c) => c.appSlug === slug)?.appName ?? slug;
+      system +=
+        '\n\nSome apps have several accounts connected, and each account has its own set of tools. Every ' +
+        "tool's name starts with its account's connection name, so use the tools of the account the user " +
+        "means. If they don't say which and it matters, ask; if they mean all of them, go through each.\n" +
+        pinnedServers
+          .map((server) => `• ${server.name}: ${appName(server.appSlug)} — ${server.accountLabel}`)
+          .join('\n');
+    }
     if (localTools.some((tool) => tool.name === LOAD_APP_TOOLS)) {
       system +=
         "\n\nEach connected app comes with only the actions this message seemed to need. If you need one you don't " +

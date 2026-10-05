@@ -59,6 +59,33 @@ export interface PipedreamMcpServer {
   appSlug: string;
   name: string;
   url: string;
+  /** The account's label, when the server is pinned to one of several accounts. */
+  accountLabel?: string;
+  /** The app router's id for it; see {@link RemoteMcpServer.routeId}. */
+  routeId?: string;
+}
+
+/** One of several accounts of an app, to be served as its own MCP server. */
+export interface PipedreamAccountTarget {
+  appSlug: string;
+  accountId: string;
+  label: string;
+}
+
+/**
+ * A short, name-safe tag for an account label: "Alnyra (alnyra-com.myshopify.com)"
+ * becomes "alnyra". It goes into the server name, which prefixes every tool the
+ * model sees, so the model can tell one store's tools from another's.
+ */
+export function accountTag(label: string): string {
+  const tag = label
+    .toLowerCase()
+    .replace(/\(.*\)/g, ' ')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 24)
+    .replace(/-+$/g, '');
+  return tag || 'account';
 }
 
 /** A single action an app exposes — surfaced as an MCP tool to the LLM. */
@@ -324,6 +351,43 @@ export class PipedreamService implements OnModuleInit {
    * app connected under two scopes (e.g. a team and a private account) produces
    * two distinct, non-colliding servers.
    */
+  /**
+   * Like {@link buildMcpServers}, but one server per account, each pinned with
+   * Pipedream's `accountId` parameter. Used when a scope holds several accounts
+   * of one app: unpinned, Pipedream picks an account by itself, and on 30 Sept
+   * 2026 a revenue question meant for 33 stores ran against whichever one that
+   * happened to be.
+   */
+  buildAccountMcpServers(
+    externalUserId: string,
+    accounts: PipedreamAccountTarget[],
+  ): PipedreamMcpServer[] {
+    const pd = this.configService.get('pipedream', { infer: true });
+    const scope = externalUserId.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const used = new Set<string>();
+    return accounts.map(({ appSlug, accountId, label }) => {
+      // Two stores can share a tag ("store", "store"); the account id's tail
+      // keeps the server names apart.
+      let tag = accountTag(label);
+      if (used.has(`${appSlug}-${tag}`)) tag = `${tag}-${accountId.slice(-4).toLowerCase()}`;
+      used.add(`${appSlug}-${tag}`);
+      const params = new URLSearchParams({
+        projectId: pd.projectId,
+        environment: pd.environment,
+        externalUserId,
+        app: appSlug,
+        accountId,
+      });
+      return {
+        appSlug,
+        name: `pipedream-${scope}-${appSlug}-${tag}`,
+        url: `${PIPEDREAM_MCP_BASE_URL}?${params.toString()}`,
+        accountLabel: label,
+        routeId: `${appSlug}:${tag}`,
+      };
+    });
+  }
+
   buildMcpServers(externalUserId: string, appSlugs: string[]): PipedreamMcpServer[] {
     const pd = this.configService.get('pipedream', { infer: true });
     const scope = externalUserId.replace(/[^a-zA-Z0-9_-]/g, '_');
