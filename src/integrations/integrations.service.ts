@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { App, CreateTokenResponse } from '@pipedream/sdk';
 import Redis from 'ioredis';
@@ -9,6 +9,7 @@ import { Integration, IntegrationAccessLevel, IntegrationProvider } from '../dat
 import { ConfirmConnectionDto } from './dto';
 import { MetaMcpServer, MetaMcpService } from './meta-mcp.service';
 import { AppTool, PipedreamService } from './pipedream.service';
+import { checkShopifyConnection, SHOPIFY_APP_SLUGS, shopifyAccountName } from './shopify-check';
 import type { SheetsCredential } from './sheets.service';
 
 /** How long a pending Meta OAuth handshake (PKCE verifier + scope) lives. */
@@ -299,6 +300,33 @@ export class IntegrationsService {
       throw new NotFoundException('Connected account not found for this scope');
     }
 
+    const slug = account.app?.nameSlug ?? appSlug;
+    // Shopify takes whatever is typed into its form without asking the store,
+    // so a wrong key used to land as "connected" and fail on every call. Ask
+    // the store first; a refused key is removed again and explained.
+    let shopifyName: string | null = null;
+    if (SHOPIFY_APP_SLUGS.has(slug)) {
+      const check = await checkShopifyConnection({
+        appSlug: slug,
+        credentials: await this.pipedream.getAccountCredentials(account.id).catch(() => null),
+        get: (url) =>
+          this.pipedream.proxyRequest({ externalUserId, accountId: account.id }, { url }),
+      });
+      if (!check.ok) {
+        await this.pipedream
+          .deleteAccount(account.id)
+          .catch((error: unknown) =>
+            this.logger.warn(
+              `Could not remove refused Shopify account ${account.id}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            ),
+          );
+        throw new BadRequestException(check.message);
+      }
+      shopifyName = shopifyAccountName(check);
+    }
+
     const existing = await this.integrationRepository.findOne({
       where: { workspaceId, externalAccountId: account.id },
     });
@@ -312,9 +340,9 @@ export class IntegrationsService {
       });
 
     integration.userId = existing?.userId ?? userId;
-    integration.appSlug = account.app?.nameSlug ?? appSlug;
+    integration.appSlug = slug;
     integration.appName = account.app?.name ?? appSlug;
-    integration.accountName = account.name ?? null;
+    integration.accountName = shopifyName ?? account.name ?? null;
     integration.nickname = nickname?.trim() || null;
     integration.accessLevel = accessLevel;
     integration.iconUrl = account.app?.imgSrc ?? null;
