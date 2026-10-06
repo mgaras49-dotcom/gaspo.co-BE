@@ -176,6 +176,21 @@ const LOCAL_TOOLS: ToolSpec[] = [
 ];
 
 /**
+ * The low-balance footer {@link AiService.run} adds to an answer, which Slack
+ * stores with it. Replayed later it reads as the current balance: on 5 Oct
+ * 2026, a day after a $100 top-up, Gaspo told Matthew he had "about $1.45 of
+ * credits left" and asked whether to top up first — the figure from a 3 Oct
+ * footer still in the thread.
+ */
+const BALANCE_NUDGE =
+  /\s*_Heads up: this workspace has about \$[\d.,]+ of credits left\. Top up at <[^>]*>\._/g;
+
+/** An earlier answer as it should be replayed: without its stale balance footer. */
+export function withoutBalanceNudge(content: string): string {
+  return content.replace(BALANCE_NUDGE, '');
+}
+
+/**
  * Actions sent whenever their app is, because nearly every other action of the
  * app needs what they return and their own descriptions don't say so. Google
  * Ads' list of reachable accounts is described only as "options for the Account
@@ -1068,7 +1083,11 @@ export class AiService {
     const messages: ProviderMessage[] = [
       ...(options.history ?? []).map((turn) =>
         turn.role === 'assistant'
-          ? { role: 'assistant' as const, content: turn.content, toolCalls: [] }
+          ? {
+              role: 'assistant' as const,
+              content: withoutBalanceNudge(turn.content),
+              toolCalls: [],
+            }
           : { role: 'user' as const, content: turn.content, attachments: turn.attachments },
       ),
       {
