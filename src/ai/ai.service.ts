@@ -15,6 +15,8 @@ import { ToolRouterService } from './providers/tool-router.service';
 import { AttachedApps, AttachedAppsService } from './providers/attached-apps.service';
 import { buildCatalog, ModelDefinition } from './providers/model-catalog';
 import { Attachment } from './attachments';
+import { describeNow } from './clock';
+import { LOAD_APP_TOOLS, LOAD_APP_TOOLS_TOOL, matchAppServers } from './app-loading-tools';
 import {
   AttachmentRejectedError,
   LlmProvider,
@@ -35,7 +37,7 @@ import {
 } from '../integrations/integrations.service';
 import { MetaAdsService } from '../integrations/meta-ads.service';
 import { WorkspaceMemoryService } from '../memory/workspace-memory.service';
-import { PipedreamService } from '../integrations/pipedream.service';
+import { PipedreamAccountTarget, PipedreamService } from '../integrations/pipedream.service';
 import { RoasService } from '../integrations/roas.service';
 import { XeroReportName, XeroService } from '../integrations/xero.service';
 import { ExportsService } from '../exports/exports.service';
@@ -173,6 +175,44 @@ const LOCAL_TOOLS: ToolSpec[] = [
   CREATE_PDF_TOOL,
 ];
 
+/**
+ * The low-balance footer {@link AiService.run} adds to an answer, which Slack
+ * stores with it. Replayed later it reads as the current balance: on 5 Oct
+ * 2026, a day after a $100 top-up, Gaspo told Matthew he had "about $1.45 of
+ * credits left" and asked whether to top up first — the figure from a 3 Oct
+ * footer still in the thread.
+ */
+const BALANCE_NUDGE =
+  /\s*_Heads up: this workspace has about \$[\d.,]+ of credits left\. Top up at <[^>]*>\._/g;
+
+/** An earlier answer as it should be replayed: without its stale balance footer. */
+export function withoutBalanceNudge(content: string): string {
+  return content.replace(BALANCE_NUDGE, '');
+}
+
+/**
+ * Actions sent whenever their app is, because nearly every other action of the
+ * app needs what they return and their own descriptions don't say so. Google
+ * Ads' list of reachable accounts is described only as "options for the Account
+ * ID field", so the router never picked it: asked to edit The Business
+ * Builders' account, Gaspo said it had no way to find it and asked Matthew for
+ * the customer ID.
+ */
+const ALWAYS_ATTACHED_ACTIONS: Record<string, string[]> = {
+  google_ads: ['google_ads-list-account-id-options'],
+};
+
+/** A routed action list plus the app's always-attached actions it actually has. */
+export function withAlwaysAttached(
+  appSlug: string,
+  chosen: string[],
+  actions: Array<{ name: string }>,
+): string[] {
+  const available = new Set(actions.map((action) => action.name));
+  const always = (ALWAYS_ATTACHED_ACTIONS[appSlug] ?? []).filter((name) => available.has(name));
+  return [...new Set([...chosen, ...always])];
+}
+
 const SYSTEM_PROMPT = `You are Gaspo, an AI assistant for a workspace. You can take actions across the user's connected apps using the available tools. Prefer acting over describing: when a request maps to a tool, use it. When you lack a connected app needed for a request, say so plainly and name the app to connect. Shopify is the one app that cannot connect in one click: Shopify only admits outside tools through a custom app the store owner creates. If asked how to connect it, walk them through it — in the Shopify Dev Dashboard create an app, paste in the redirect URL Gaspo's connect screen shows, choose what Gaspo may read (orders, products, customers) and install the app on the store; then on Gaspo's Integrations page choose "Shopify" and enter the shop ID (the "acme-co" in acme-co.myshopify.com) plus the app's Client ID and Client Secret. Before any action that creates, edits, deletes, or starts spending on a connected app — especially Meta Ads campaigns (creating, activating, changing budgets, or deleting) — state exactly what you will do and get the user's explicit confirmation first; never perform such actions speculatively.
 
 You can also build web apps for the workspace, each hosted at its own link with passwordless (magic-link) login, and there are two kinds. For something people read and use — a plan or gameplan, strategy, report, calculator, or a dashboard that presents analysis — build a page with create_page: you write the whole page as HTML, designed to the standard of a polished Claude artifact. For a tool where people keep entering and tracking records over time — a time logger, lead tracker, or content calendar — build an app with create_space, described as entities (data types with typed fields) and views (forms, tables, dashboards); when it should start with content, such as a checklist's items, put that in as starting rows with its records, and fill an existing app with add_space_records. When someone asks for a plan, gameplan or dashboard, build a page. Never invent or share end-user passwords; logins are always magic links. After building either, give the user its link and tell them how to get in: anyone on this team who is signed in to the Gaspo dashboard opens it signed in straight away, and otherwise they enter the email on their Slack profile and get a sign-in link from you as a Slack DM. Gaspo cannot email sign-in links, so people outside this team's Slack cannot sign in yet — never tell anyone to check their email.
@@ -197,7 +237,11 @@ People can attach files to their messages, and the files come with the message: 
 
 Your replies are delivered in Slack, so format for Slack's mrkdwn — not Markdown: use *single asterisks* for bold (never **double**, which Slack shows literally), _underscores_ for italics, and a leading "• " for bullets. Don't use # headings or [text](url) links; write links as <https://example.com|label>.
 
-Be brief and lead with the answer. Put the direct response in the first sentence, then add only the detail the request actually needs. Prefer a few short sentences; use a short bulleted list only when giving steps or options. Don't restate the question, stack on caveats, or list the tools you have unless asked.`;
+Be brief and lead with the answer. Put the direct response in the first sentence, then add only the detail the request actually needs. Prefer a few short sentences; use a short bulleted list only when giving steps or options. Don't restate the question, stack on caveats, or list the tools you have unless asked.
+
+When a request is clear, do it, then report what you did — not what you held back or why. Ask a question only when you truly cannot proceed without the answer, and then ask just one.
+
+Each new message ends with the current date and time for the person asking. Use it for anything time-relative ("today", "last week", "what time is it") and never say you don't know the date or time.`;
 
 /**
  * Said on runs that can reach the web: Anthropic's server-side search and fetch
@@ -430,6 +474,27 @@ export class AiService {
     }
     if (!chosen.size) return [];
 
+    // Accounts of one app share its catalogue, so its actions are routed once
+    // however many accounts are attached.
+    const routed = new Map<string, Promise<string[] | null>>();
+    const routeActions = (appSlug: string): Promise<string[] | null> => {
+      let decision = routed.get(appSlug);
+      if (!decision) {
+        decision = this.appActions(appSlug).then(async (actions) => {
+          if (!actions.length) return null;
+          const chosen = await this.toolRouter.selectRelevantActions(
+            provider,
+            modelId,
+            prompt,
+            actions,
+          );
+          return chosen ? withAlwaysAttached(appSlug, chosen, actions) : null;
+        });
+        routed.set(appSlug, decision);
+      }
+      return decision;
+    };
+
     const attaching: AttachedApps = {};
     const attached = await Promise.all(
       // Preserve the input order so the same set of apps always renders the same
@@ -446,10 +511,7 @@ export class AiService {
             return { ...server, enabledTools: undefined };
           }
 
-          const actions = await this.appActions(server.appSlug);
-          const enabled = actions.length
-            ? await this.toolRouter.selectRelevantActions(provider, modelId, prompt, actions)
-            : null;
+          const enabled = await routeActions(server.appSlug);
 
           // Null means "expose the app whole" — the fail-open answer for an app
           // too small to route, an unreachable catalogue, or a router error. For
@@ -517,6 +579,106 @@ export class AiService {
   }
 
   /**
+   * Answer a load_app_tools call: route the named app's actions against what the
+   * model says it needs, add them to the servers for the rest of the run, and
+   * remember them for the conversation so the next turn starts with them too.
+   * Only ever widens — an action already attached stays attached.
+   */
+  private async loadAppTools(
+    provider: LlmProvider,
+    modelId: string,
+    input: Record<string, unknown>,
+    ctx: {
+      servers: RemoteMcpServer[];
+      attached: RemoteMcpServer[];
+      appNames: Map<string, string>;
+      workspaceId: string;
+      /** The conversation and the one branching off it, both of which keep what loads. */
+      conversationIds: Array<string | null>;
+    },
+  ): Promise<{ servers: RemoteMcpServer[]; message: string; isError: boolean }> {
+    const app = typeof input.app === 'string' ? input.app : '';
+    const account = typeof input.account === 'string' ? input.account : undefined;
+    const need = typeof input.need === 'string' && input.need.trim() ? input.need : app;
+    const matched = matchAppServers(app, ctx.servers, ctx.appNames, account);
+    if (!matched.length && account && matchAppServers(app, ctx.servers, ctx.appNames).length) {
+      const accounts = matchAppServers(app, ctx.servers, ctx.appNames)
+        .map((s) => s.accountLabel)
+        .filter(Boolean);
+      return {
+        servers: ctx.attached,
+        isError: true,
+        message: `No ${app} account matches "${account}". Its accounts: ${accounts.join(', ')}.`,
+      };
+    }
+    if (!matched.length) {
+      const connected = [
+        ...new Set(ctx.servers.map((s) => ctx.appNames.get(s.appSlug) ?? s.appSlug)),
+      ];
+      return {
+        servers: ctx.attached,
+        isError: true,
+        message:
+          `No connected app matches "${app}". Connected apps: ${connected.join(', ') || 'none'}. ` +
+          'If the one you need is not among them, tell the user to connect it.',
+      };
+    }
+
+    let servers = [...ctx.attached];
+    const remembered: AttachedApps = {};
+    const loaded: string[] = [];
+    // Accounts of one app share its catalogue: route its actions once.
+    const routed = new Map<string, Promise<string[] | null>>();
+    for (const server of matched) {
+      const label = [ctx.appNames.get(server.appSlug) ?? server.appSlug, server.accountLabel]
+        .filter(Boolean)
+        .join(' — ');
+      const current = servers.find((s) => s.name === server.name);
+      if (current && !current.enabledTools) {
+        loaded.push(`${label}: every action is already available`);
+        continue;
+      }
+      let decision = routed.get(server.appSlug);
+      if (!decision) {
+        const appSlug = server.appSlug;
+        decision = this.appActions(appSlug).then(async (actions) => {
+          if (!actions.length) return null;
+          const chosen = await this.toolRouter.selectRelevantActions(
+            provider,
+            modelId,
+            need,
+            actions,
+          );
+          return chosen ? withAlwaysAttached(appSlug, chosen, actions) : null;
+        });
+        routed.set(appSlug, decision);
+      }
+      const chosen = await decision;
+      // Null is the router's "could not narrow" — the app goes whole, as on attach.
+      const enabledTools = chosen
+        ? [...new Set([...(current?.enabledTools ?? []), ...chosen])]
+        : undefined;
+      const widened = { ...server, enabledTools };
+      servers = current
+        ? servers.map((s) => (s.name === server.name ? widened : s))
+        : [...servers, widened];
+      remembered[server.name] = enabledTools ?? [];
+      loaded.push(`${label}: ${enabledTools ? enabledTools.join(', ') : 'every action'}`);
+    }
+    if (Object.keys(remembered).length) {
+      for (const conversationId of ctx.conversationIds) {
+        if (conversationId)
+          await this.attachedApps.merge(ctx.workspaceId, conversationId, remembered);
+      }
+    }
+    return {
+      servers,
+      isError: false,
+      message: `Loaded. You can now call these directly — ${loaded.join('; ')}.`,
+    };
+  }
+
+  /**
    * Run a single prompt for a workspace, exposing its connected apps as tools,
    * and return Gaspo's answer plus the actions it took.
    *
@@ -557,9 +719,18 @@ export class AiService {
       /** Lazily resolves the requester's IANA timezone (their Slack profile), so
        * "every morning at 8" means their 8am. Optional — omitted off-Slack. */
       fetchRequesterTimezone?: () => Promise<string | null>;
+      /** A known IANA timezone for the run (a scheduled task's), used for the
+       * date and time the model is told when there is no Slack requester. */
+      timezone?: string | null;
     } = {},
   ): Promise<AiRunResult> {
     const confirmVia: ConfirmMode = options.confirmVia ?? 'inline';
+    // One lookup per run, shared by the clock below and any task created in it.
+    let timezoneLookup: Promise<string | null> | undefined;
+    const resolveTimezone = (): Promise<string | null> =>
+      (timezoneLookup ??= options.timezone
+        ? Promise.resolve(options.timezone)
+        : (options.fetchRequesterTimezone?.().catch(() => null) ?? Promise.resolve(null)));
     const ai = this.configService.get('ai', { infer: true });
     const appUrl = this.configService.get('app', { infer: true }).frontendUrl;
     const billingUrl = `${appUrl}/dashboard/billing`;
@@ -611,23 +782,43 @@ export class AiService {
       await this.integrationsService.findVisibleForUser(workspaceId, userId)
     ).filter((c) => c.isActive);
     const pipedreamConnected = connected.filter((c) => c.provider === 'pipedream');
-    const teamSlugs = [
-      ...new Set(pipedreamConnected.filter((c) => c.accessLevel === 'team').map((c) => c.appSlug)),
-    ];
-    const privateSlugs = userId
-      ? [
-          ...new Set(
-            pipedreamConnected.filter((c) => c.accessLevel === 'private').map((c) => c.appSlug),
-          ),
-        ]
-      : [];
-
+    // One server per app, or per account when a scope holds several accounts of
+    // one app: unpinned, Pipedream picks the account itself, which sent a
+    // question about 33 Shopify stores to whichever one it chose.
+    const serversFor = (externalUserId: string, accounts: ConnectedIntegrationView[]) => {
+      const bySlug = new Map<string, ConnectedIntegrationView[]>();
+      for (const account of accounts) {
+        bySlug.set(account.appSlug, [...(bySlug.get(account.appSlug) ?? []), account]);
+      }
+      const whole: string[] = [];
+      const pinned: PipedreamAccountTarget[] = [];
+      for (const [appSlug, list] of bySlug) {
+        if (list.length < 2 || list.some((account) => !account.externalAccountId)) {
+          whole.push(appSlug);
+          continue;
+        }
+        for (const account of list) {
+          pinned.push({
+            appSlug,
+            accountId: account.externalAccountId as string,
+            label: account.nickname ?? account.accountName ?? (account.externalAccountId as string),
+          });
+        }
+      }
+      return [
+        ...(whole.length ? this.pipedream.buildMcpServers(externalUserId, whole) : []),
+        ...(pinned.length ? this.pipedream.buildAccountMcpServers(externalUserId, pinned) : []),
+      ];
+    };
     const pipedreamServers = [
-      ...(teamSlugs.length ? this.pipedream.buildMcpServers(workspaceId, teamSlugs) : []),
-      ...(privateSlugs.length && userId
-        ? this.pipedream.buildMcpServers(
+      ...serversFor(
+        workspaceId,
+        pipedreamConnected.filter((c) => c.accessLevel === 'team'),
+      ),
+      ...(userId
+        ? serversFor(
             PipedreamService.privateExternalUserId(userId),
-            privateSlugs,
+            pipedreamConnected.filter((c) => c.accessLevel === 'private'),
           )
         : []),
     ];
@@ -638,6 +829,9 @@ export class AiService {
       name: server.name,
       url: server.url,
       authorizationToken: pipedreamToken ?? undefined,
+      ...(server.accountLabel
+        ? { accountLabel: server.accountLabel, routeId: server.routeId }
+        : {}),
     }));
 
     // Meta Ads is NOT exposed as an MCP server: Meta's hosted Ads MCP is
@@ -664,6 +858,9 @@ export class AiService {
       // Offered only when a provider is configured, so without one the model
       // says it cannot make images instead of calling a tool that always fails.
       ...(this.imageGeneration.isConfigured() ? [GENERATE_IMAGE_TOOL] : []),
+      // Server-side MCP is the path that narrows apps to a few actions, so it is
+      // the one that needs a way to widen them again mid-run.
+      ...(model.supportsRemoteMcp && servers.length ? [LOAD_APP_TOOLS_TOOL] : []),
     ];
 
     // The apps this run ended up with, filled in once the toolset is resolved
@@ -695,6 +892,23 @@ export class AiService {
           .map((line) => `• ${line}`)
           .join('\n')}`
       : `${SYSTEM_PROMPT}\n\nNo apps are connected in this workspace yet.`;
+    const pinnedServers = servers.filter((server) => server.accountLabel);
+    if (pinnedServers.length) {
+      const appName = (slug: string) => connected.find((c) => c.appSlug === slug)?.appName ?? slug;
+      system +=
+        '\n\nSome apps have several accounts connected, and each account has its own set of tools. Every ' +
+        "tool's name starts with its account's connection name, so use the tools of the account the user " +
+        "means. If they don't say which and it matters, ask; if they mean all of them, go through each.\n" +
+        pinnedServers
+          .map((server) => `• ${server.name}: ${appName(server.appSlug)} — ${server.accountLabel}`)
+          .join('\n');
+    }
+    if (localTools.some((tool) => tool.name === LOAD_APP_TOOLS)) {
+      system +=
+        "\n\nEach connected app comes with only the actions this message seemed to need. If you need one you don't " +
+        'have, or an app above has no tools here, call load_app_tools and carry on. Never say a connected app ' +
+        'cannot do something before calling it.';
+    }
     // Tell the model who it is serving, so the ownership annotations above have
     // a referent. An unmatched Slack sender is flagged explicitly: their private
     // connections are unreachable, and the model must not paper over that by
@@ -709,6 +923,11 @@ export class AiService {
         `If they ask for personal data or for an app that is missing, tell them to sign in with ` +
         `Slack at <${appUrl}|${appUrl}> so their account and private connections link up.`;
     }
+    // Gaspo's own plans and credits live on the dashboard, not behind a tool, so
+    // without the link "I want to pay for Gaspo" got "not something I can set up".
+    system +=
+      `\n\nGaspo's own plans, credits and billing are on the dashboard at <${billingUrl}|${billingUrl}>. ` +
+      'When someone wants to subscribe, pay for Gaspo, top up or check their credits, give them that link.';
     // Durable workspace facts ride along on every run so the model has standing
     // context (targets, preferences) without a tool call. Best-effort: null on
     // a read failure or an empty memory.
@@ -857,13 +1076,25 @@ export class AiService {
     // never tool_use blocks, so there are no dangling tool-result pairs.
     // Files ride on the turn they were attached to, so a follow-up about a
     // document shared three messages ago still has the document.
+    // The clock rides on the new message, not in the system prompt: a timestamp
+    // there would change the cached prefix every minute. It is not stored, so
+    // replayed turns never carry a stale time.
+    const now = describeNow(new Date(), await resolveTimezone());
     const messages: ProviderMessage[] = [
       ...(options.history ?? []).map((turn) =>
         turn.role === 'assistant'
-          ? { role: 'assistant' as const, content: turn.content, toolCalls: [] }
+          ? {
+              role: 'assistant' as const,
+              content: withoutBalanceNudge(turn.content),
+              toolCalls: [],
+            }
           : { role: 'user' as const, content: turn.content, attachments: turn.attachments },
       ),
-      { role: 'user' as const, content: prompt, attachments: options.attachments },
+      {
+        role: 'user' as const,
+        content: `${prompt}\n\n[Current date and time for the person asking: ${now}]`,
+        attachments: options.attachments,
+      },
     ];
     const actions: AiAction[] = [];
     const spaces: AiSpace[] = [];
@@ -960,12 +1191,33 @@ export class AiService {
         });
         const results: ToolResult[] = [];
         for (const call of response.toolCalls) {
+          if (call.name === LOAD_APP_TOOLS) {
+            const loaded = await this.loadAppTools(provider, model.id, call.input, {
+              servers,
+              attached: mcpServers,
+              appNames: new Map(connected.map((c) => [c.appSlug, c.appName])),
+              workspaceId,
+              conversationIds: [
+                options.conversationId ?? null,
+                options.branchConversationId ?? null,
+              ],
+            });
+            mcpServers = loaded.servers;
+            actions.push({ app: 'apps', tool: call.name, isError: loaded.isError });
+            results.push({
+              id: call.id,
+              name: call.name,
+              content: loaded.message,
+              isError: loaded.isError,
+            });
+            continue;
+          }
           const result = await this.runTool(workspaceId, userId, call, bridged, spaces, {
             confirmVia,
             pending,
             fetchMemberCount: options.fetchMemberCount,
             slackChannelId: options.slackChannelId ?? null,
-            fetchRequesterTimezone: options.fetchRequesterTimezone,
+            fetchRequesterTimezone: resolveTimezone,
             files,
             referenceImages,
             imageCost,

@@ -66,7 +66,9 @@ const SERVER_ROUTER_SYSTEM_PROMPT =
   'Attaching an app is cheap — only the handful of its actions the request needs ' +
   'are loaded — so bias toward including one. Include any app needed to gather ' +
   'ids or context first. Return an empty array only when no connected app could ' +
-  'contribute. Respond with the JSON array only — no prose, no code fences.';
+  'contribute. Where one app has several accounts, each is listed as its own id ' +
+  '("app:account"): pick the accounts the request is about, and every one of them only when it ' +
+  'is about all of them. Respond with the JSON array only — no prose, no code fences.';
 
 /**
  * Picks which bridged tools are worth sending for a given message.
@@ -220,8 +222,15 @@ export class ToolRouterService {
   ): Promise<RemoteMcpServer[] | null> {
     if (servers.length <= SERVER_ROUTE_THRESHOLD) return null;
 
+    // An app with several accounts lists each one, so a request about one
+    // Shopify store attaches that store and not all thirty of them.
+    const routeId = (server: RemoteMcpServer) => server.routeId ?? server.appSlug;
     const catalog = servers
-      .map((server) => `- ${server.appSlug} (${this.humanise(server.appSlug)})`)
+      .map(
+        (server) =>
+          `- ${routeId(server)} (${this.humanise(server.appSlug)}` +
+          `${server.accountLabel ? ` — account: ${server.accountLabel}` : ''})`,
+      )
       .join('\n');
     // Names only. They are self-describing (`meta_ads_list_campaigns`,
     // `verify_roas`), and full descriptions would cost more than the decision
@@ -276,7 +285,10 @@ export class ToolRouterService {
     }
 
     const wanted = new Set(slugs);
-    const selected = servers.filter((server) => wanted.has(server.appSlug));
+    // A bare app id for an app listed account by account means all its accounts.
+    const selected = servers.filter(
+      (server) => wanted.has(routeId(server)) || wanted.has(server.appSlug),
+    );
 
     // Every name came back hallucinated, so there is no way to tell what was
     // meant. Falling back costs tokens but never capability.

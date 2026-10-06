@@ -58,6 +58,15 @@ export interface RemoteMcpServer {
   url: string;
   authorizationToken?: string;
   /**
+   * Set when this is one of several accounts of the same app, each served as
+   * its own server: the account's label (a Shopify store's name, a mailbox).
+   * Routing and the prompt name it, so a request about one store reaches that
+   * store rather than whichever account Pipedream would pick by itself.
+   */
+  accountLabel?: string;
+  /** How the app router refers to this server: the app slug, plus the account when there are several. */
+  routeId?: string;
+  /**
    * The subset of the app's actions to expose, by MCP tool name. A server's
    * whole action list is otherwise fetched and billed on every turn, and an app
    * like Google Ads carries 35 of them — measured at ~108K prompt tokens against

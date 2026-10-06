@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { proxyErrorMessage } from './pipedream.service';
+import { accountTag, PipedreamService, proxyErrorMessage } from './pipedream.service';
 
 /**
  * Every Connect proxy failure reaches a user through this function — a Slack
@@ -47,4 +47,28 @@ test('an unrecognised failure yields null so the original error survives', () =>
   assert.equal(proxyErrorMessage({ body: { error: { code: 500 } } }), null);
   assert.equal(proxyErrorMessage({ body: {} }), null);
   assert.equal(proxyErrorMessage(undefined), null);
+});
+
+test('accountTag makes a short, name-safe tag from a store label', () => {
+  assert.equal(accountTag('Alnyra (alnyra-com.myshopify.com)'), 'alnyra');
+  assert.equal(accountTag('Tech & Gamers (house-store-og.myshopify.com)'), 'tech-gamers');
+  assert.equal(accountTag('zyntric-16.myshopify.com'), 'zyntric-16-myshopify-com');
+  assert.equal(accountTag('(no name)'), 'account');
+});
+
+test('buildAccountMcpServers pins each server to its account and keeps names apart', () => {
+  const service = new PipedreamService({
+    get: () => ({ projectId: 'proj_1', environment: 'production' }),
+  } as never);
+  const servers = service.buildAccountMcpServers('ws-1', [
+    { appSlug: 'shopify', accountId: 'apn_AAAA1111', label: 'Store (a.myshopify.com)' },
+    { appSlug: 'shopify', accountId: 'apn_BBBB2222', label: 'Store (b.myshopify.com)' },
+  ]);
+  assert.deepEqual(
+    servers.map((s) => s.name),
+    ['pipedream-ws-1-shopify-store', 'pipedream-ws-1-shopify-store-2222'],
+  );
+  assert.equal(new URL(servers[1].url).searchParams.get('accountId'), 'apn_BBBB2222');
+  assert.equal(servers[0].routeId, 'shopify:store');
+  assert.equal(servers[1].accountLabel, 'Store (b.myshopify.com)');
 });

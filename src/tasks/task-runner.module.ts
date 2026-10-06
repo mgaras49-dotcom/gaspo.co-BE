@@ -3,6 +3,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { AiModule } from '../ai/ai.module';
 import { ScheduledTask } from '../database/entities';
 import { SlackModule } from '../slack/slack.module';
+import { UsersModule } from '../users/users.module';
 import { WorkspacesModule } from '../workspaces/workspaces.module';
 import { TaskRunnerService } from './task-runner.service';
 import { TasksController } from './tasks.controller';
@@ -16,6 +17,7 @@ import { TasksScheduler } from './tasks.scheduler';
     AiModule,
     SlackModule,
     TasksModule,
+    UsersModule,
     WorkspacesModule,
   ],
   controllers: [TasksController],
