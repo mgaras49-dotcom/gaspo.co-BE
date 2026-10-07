@@ -110,7 +110,7 @@ import {
   TASK_TOOL_NAMES,
   TASK_TOOLS,
 } from './task-tools';
-import { GET_WORKSPACE_STATS, WORKSPACE_TOOLS } from './workspace-tools';
+import { GET_CREDIT_BALANCE, GET_WORKSPACE_STATS, WORKSPACE_TOOLS } from './workspace-tools';
 import { XERO_GET_REPORT, XERO_TOOLS } from './xero-tools';
 import { CREATE_PDF, CREATE_PDF_TOOL, FILE_TOOL_NAMES, GENERATE_IMAGE_TOOL } from './file-tools';
 
@@ -927,7 +927,8 @@ export class AiService {
     // without the link "I want to pay for Gaspo" got "not something I can set up".
     system +=
       `\n\nGaspo's own plans, credits and billing are on the dashboard at <${billingUrl}|${billingUrl}>. ` +
-      'When someone wants to subscribe, pay for Gaspo, top up or check their credits, give them that link.';
+      'When someone wants to subscribe, pay for Gaspo or top up, give them that link; when they ask how many credits ' +
+      'they have left, call get_credit_balance and answer with the figure.';
     // Durable workspace facts ride along on every run so the model has standing
     // context (targets, preferences) without a tool call. Best-effort: null on
     // a read failure or an empty memory.
@@ -1421,7 +1422,7 @@ export class AiService {
   /** The app label a local tool's action is attributed to in the run audit. */
   private localToolApp(toolName: string): string {
     if (META_ADS_TOOL_NAMES.has(toolName)) return 'meta_ads';
-    if (toolName === GET_WORKSPACE_STATS) return 'workspace';
+    if (toolName === GET_WORKSPACE_STATS || toolName === GET_CREDIT_BALANCE) return 'workspace';
     if (MEMORY_TOOL_NAMES.has(toolName)) return 'memory';
     if (ROAS_TOOL_NAMES.has(toolName)) return 'roas';
     if (RULE_TOOL_NAMES.has(toolName)) return 'rules';
@@ -1450,6 +1451,9 @@ export class AiService {
   ): Promise<LocalToolResult> {
     if (toolUse.name === GET_WORKSPACE_STATS) {
       return this.runWorkspaceStatsTool(workspaceId, toolUse, fetchMemberCount);
+    }
+    if (toolUse.name === GET_CREDIT_BALANCE) {
+      return this.runCreditBalanceTool(workspaceId, toolUse);
     }
     if (META_ADS_TOOL_NAMES.has(toolUse.name)) {
       return this.runMetaAdsTool(workspaceId, userId, toolUse, ctx);
@@ -2308,6 +2312,41 @@ export class AiService {
    * roster when available). Read-only and best-effort: a query failure becomes an
    * error result the model can relay, never a failed request.
    */
+  /** The workspace's live credit position, in credits and dollars, by bucket. */
+  private async runCreditBalanceTool(
+    workspaceId: string,
+    toolUse: ToolCall,
+  ): Promise<LocalToolResult> {
+    try {
+      const balance = await this.usageService.getBalance(workspaceId);
+      const dollars = (credits: number) => Math.round((credits / CREDITS_PER_DOLLAR) * 100) / 100;
+      const appUrl = this.configService.get('app', { infer: true }).frontendUrl;
+      const payload = {
+        credits: balance.balance,
+        dollars: dollars(balance.balance),
+        buckets: balance.buckets
+          .filter((bucket) => bucket.credits > 0)
+          .map((bucket) => ({
+            kind: bucket.bucket,
+            credits: bucket.credits,
+            dollars: dollars(bucket.credits),
+            expiresAt: bucket.expiresAt,
+          })),
+        billingUrl: `${appUrl}/dashboard/billing`,
+      };
+      return { type: 'tool_result', tool_use_id: toolUse.id, content: JSON.stringify(payload) };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`get_credit_balance failed: ${message}`);
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUse.id,
+        content: `Could not read the credit balance: ${message}`,
+        is_error: true,
+      };
+    }
+  }
+
   private async runWorkspaceStatsTool(
     workspaceId: string,
     toolUse: ToolCall,

@@ -33,4 +33,22 @@ export const GET_WORKSPACE_STATS_TOOL: ToolSpec = {
   parameters: { type: 'object', properties: {} },
 };
 
-export const WORKSPACE_TOOLS = [GET_WORKSPACE_STATS_TOOL];
+/** Tool name for the workspace's own Gaspo credit balance. */
+export const GET_CREDIT_BALANCE = 'get_credit_balance';
+
+/**
+ * Asked "How many credits do I have left?" on 6 Oct 2026, Gaspo could only say
+ * "I can't see credit balances" — the figure lives in Gaspo's own ledger, which
+ * no tool read.
+ */
+export const GET_CREDIT_BALANCE_TOOL: ToolSpec = {
+  name: GET_CREDIT_BALANCE,
+  description:
+    "Get this workspace's Gaspo credit balance right now: credits left, their dollar value, and " +
+    'which of them expire when (plan credits expire, bought and free ones do not). Use it whenever ' +
+    'someone asks how many credits they have, what they have left, or whether they need to top up. ' +
+    'Answer with the dollar figure first, and add the billing link if they want more.',
+  parameters: { type: 'object', properties: {} },
+};
+
+export const WORKSPACE_TOOLS = [GET_WORKSPACE_STATS_TOOL, GET_CREDIT_BALANCE_TOOL];
