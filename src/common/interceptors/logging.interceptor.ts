@@ -30,8 +30,17 @@ export function redactUrl(url: string): string {
   return `${path}?${params.toString().replace(/%5Bredacted%5D/g, '[redacted]')}`;
 }
 
+/** The HTTP status a handler's error will answer with: an HttpException's own, else 500. */
+export function errorStatus(error: unknown): number {
+  const status = (error as { getStatus?: () => unknown })?.getStatus?.();
+  return typeof status === 'number' ? status : 500;
+}
+
 /**
- * Logs each incoming request and the time taken to handle it.
+ * Logs each incoming request and the time taken to handle it — refused and
+ * failed ones too, with their status. Only successes used to be logged, so on
+ * 7 Oct 2026, when a scanner-style signup (an *.oast.online email) walked the
+ * dashboard API, the log could show what it read but not what it was refused.
  */
 @Injectable()
 export class LoggingInterceptor implements NestInterceptor {
@@ -43,8 +52,15 @@ export class LoggingInterceptor implements NestInterceptor {
     const start = Date.now();
 
     return next.handle().pipe(
-      tap(() => {
-        this.logger.log(`${method} ${redactUrl(url)} ${Date.now() - start}ms`);
+      tap({
+        next: () => {
+          this.logger.log(`${method} ${redactUrl(url)} ${Date.now() - start}ms`);
+        },
+        error: (error: unknown) => {
+          this.logger.warn(
+            `${method} ${redactUrl(url)} ${errorStatus(error)} ${Date.now() - start}ms`,
+          );
+        },
       }),
     );
   }
