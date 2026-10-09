@@ -44,6 +44,12 @@ export class AllExceptionsFilter implements ExceptionFilter {
         `${request.method} ${path} -> ${status}`,
         exception instanceof Error ? exception.stack : String(exception),
       );
+    } else if (status >= HttpStatus.BAD_REQUEST) {
+      // Refusals too, since the request log only records successes and guards
+      // reject before it runs. On 7 Oct 2026 a scanner-style signup (an
+      // *.oast.online email) walked the dashboard API, and the log could show
+      // what it read but nothing it was refused.
+      this.logger.warn(`${request.method} ${path} -> ${status}`);
     }
 
     const body: ErrorResponseBody = {
