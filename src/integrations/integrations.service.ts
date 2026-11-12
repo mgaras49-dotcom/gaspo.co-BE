@@ -306,9 +306,17 @@ export class IntegrationsService {
     // the store first; a refused key is removed again and explained.
     let shopifyName: string | null = null;
     if (SHOPIFY_APP_SLUGS.has(slug)) {
+      const credentials = await this.pipedream.getAccountCredentials(account.id).catch(() => null);
+      if (!credentials?.shop_id) {
+        // Keys only, never values: which fields Pipedream does hand back.
+        this.logger.warn(
+          `Shopify account ${account.id} (${slug}) came without a shop_id; credential keys: ` +
+            (Object.keys(credentials ?? {}).join(', ') || 'none'),
+        );
+      }
       const check = await checkShopifyConnection({
         appSlug: slug,
-        credentials: await this.pipedream.getAccountCredentials(account.id).catch(() => null),
+        credentials,
         get: (url) =>
           this.pipedream.proxyRequest({ externalUserId, accountId: account.id }, { url }),
       });

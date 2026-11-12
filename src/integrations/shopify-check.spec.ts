@@ -84,13 +84,55 @@ void test('a passing outage does not block a key that may be fine', async () => 
   assert.deepEqual(check, { ok: true, name: null, domain: 'alnyra-com.myshopify.com' });
 });
 
-void test('a missing shop ID or unknown store is explained', async () => {
-  const missing = await checkShopifyConnection({
+void test('an OAuth store without a shop ID is asked by path and named from its answer', async () => {
+  // What Pipedream handed back for bolticc on 12 Nov 2026: OAuth material, no shop_id.
+  const urls: string[] = [];
+  const check = await checkShopifyConnection({
+    appSlug: 'shopify',
+    credentials: { oauth_access_token: 'shpua_' + 'b'.repeat(32) },
+    get: async (url) => {
+      urls.push(url);
+      return { shop: { name: 'Bolticc', myshopify_domain: 'Bolticc.myshopify.com' } };
+    },
+  });
+  assert.deepEqual(check, { ok: true, name: 'Bolticc', domain: 'bolticc.myshopify.com' });
+  assert.match(urls[0], /^\/admin\/api\/[\d-]+\/shop\.json$/);
+});
+
+void test('an OAuth store the proxy cannot name still connects, under Pipedream’s label', async () => {
+  const check = await checkShopifyConnection({
+    appSlug: 'shopify',
+    credentials: null,
+    get: async () => {
+      throw Object.assign(new Error('Status code: 400\nBody: {"error":"bad path"}'), {
+        statusCode: 400,
+      });
+    },
+  });
+  assert.deepEqual(check, { ok: true, name: null, domain: null });
+  assert.equal(shopifyAccountName({ name: null, domain: null }), null);
+});
+
+void test('a refused OAuth store is refused even without a shop ID', async () => {
+  const check = await checkShopifyConnection({
     appSlug: 'shopify',
     credentials: {},
+    get: async () => {
+      throw unauthorized;
+    },
+  });
+  assert.equal(check.ok, false);
+  assert.match(check.ok ? '' : check.message, /refused this key for the store \(401\)/);
+});
+
+void test('a missing shop ID in the token app, or an unknown store, is explained', async () => {
+  const missing = await checkShopifyConnection({
+    appSlug: 'shopify_developer_app',
+    credentials: { access_token: 'shpat_' + 'a'.repeat(32) },
     get: async () => ({}),
   });
   assert.equal(missing.ok, false);
+  assert.match(missing.ok ? '' : missing.message, /No shop ID came through/);
   const unknown = await checkShopifyConnection({
     appSlug: 'shopify',
     credentials: { shop_id: 'no-such-store' },
