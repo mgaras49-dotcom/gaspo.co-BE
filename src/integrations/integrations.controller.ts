@@ -1,4 +1,15 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, Query, Res } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Logger,
+  Param,
+  Patch,
+  Post,
+  Query,
+  Res,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ApiTags } from '@nestjs/swagger';
 import { App, CreateTokenResponse } from '@pipedream/sdk';
@@ -19,6 +30,8 @@ import { AppTool } from './pipedream.service';
 @ApiTags('integrations')
 @Controller('integrations')
 export class IntegrationsController {
+  private readonly logger = new Logger(IntegrationsController.name);
+
   constructor(
     private readonly integrationsService: IntegrationsService,
     private readonly configService: ConfigService<AppConfig, true>,
@@ -101,7 +114,12 @@ export class IntegrationsController {
       }
       await this.integrationsService.completeMetaConnect(query.state, query.code);
       redirect.searchParams.set('connected', 'meta');
-    } catch {
+    } catch (error) {
+      // The browser only ever sees `?error=meta`, so this line is the one place
+      // the real reason (expired state, token exchange rejected, ...) survives.
+      this.logger.warn(
+        `Meta connect failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
       redirect.searchParams.set('error', 'meta');
     }
     res.redirect(redirect.toString());
