@@ -93,7 +93,7 @@ services:
       # under Facebook Login for Business -> Configurations.
       - key: META_LOGIN_CONFIG_ID
         scope: RUN_TIME
-        value: "1037664415789349"
+        value: "2160627644568441"
       # Who can reach /super-admin, the cross-tenant owner panel. Comma-separated
       # and matched case-insensitively against the email Slack reports for the
       # signed-in user, so an address here only works if it is one someone can
