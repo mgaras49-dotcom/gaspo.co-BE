@@ -12,8 +12,12 @@ import { AppTool, PipedreamService } from './pipedream.service';
 import { checkShopifyConnection, SHOPIFY_APP_SLUGS, shopifyAccountName } from './shopify-check';
 import type { SheetsCredential } from './sheets.service';
 
-/** How long a pending Meta OAuth handshake (PKCE verifier + scope) lives. */
-const META_STATE_TTL_SECONDS = 600;
+/**
+ * How long a pending Meta OAuth handshake (PKCE verifier + scope) lives.
+ * Facebook's dialog plus a 2FA prompt took a real user 38 minutes once; 10
+ * minutes bounced them with "session expired", so give them half an hour.
+ */
+const META_STATE_TTL_SECONDS = 1800;
 /** Redis key prefix for pending Meta OAuth handshakes, keyed by `state`. */
 const META_STATE_PREFIX = 'meta:oauth:';
 
