@@ -25,6 +25,7 @@ import {
   UpdateIntegrationDto,
 } from './dto';
 import { ConnectedIntegrationView, IntegrationsService } from './integrations.service';
+import { MetaPermissionsError } from './meta-mcp.service';
 import { AppTool } from './pipedream.service';
 
 @ApiTags('integrations')
@@ -115,12 +116,17 @@ export class IntegrationsController {
       await this.integrationsService.completeMetaConnect(query.state, query.code);
       redirect.searchParams.set('connected', 'meta');
     } catch (error) {
-      // The browser only ever sees `?error=meta`, so this line is the one place
+      // The browser only sees a one-word error, so this line is the one place
       // the real reason (expired state, token exchange rejected, ...) survives.
       this.logger.warn(
         `Meta connect failed: ${error instanceof Error ? error.message : String(error)}`,
       );
-      redirect.searchParams.set('error', 'meta');
+      // Missing permissions is the one failure the user can act on themselves
+      // (re-tick the permissions, or get a role on the app), so name it.
+      redirect.searchParams.set(
+        'error',
+        error instanceof MetaPermissionsError ? 'meta_permissions' : 'meta',
+      );
     }
     res.redirect(redirect.toString());
   }
