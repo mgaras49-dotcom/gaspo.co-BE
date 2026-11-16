@@ -10,6 +10,52 @@ export const META_APP_NAME = 'Meta Ads';
 const META_ICON_URL = 'https://www.facebook.com/images/fb_icon_325x325.png';
 /** Refresh a token this many ms before it actually expires, to avoid races. */
 const EXPIRY_SKEW_MS = 60_000;
+/** Graph API root for the plain (non-MCP) calls: identity and token inspection. */
+const GRAPH_BASE = 'https://graph.facebook.com/v21.0';
+/**
+ * The one permission every Meta tool needs. Meta has issued `public_profile`-only
+ * tokens when the app's access level or the user's role kept the ad permissions
+ * out of the dialog; such a token looks connected and then fails every call with
+ * "(#200) Missing Permissions", so a connect without this scope is refused.
+ */
+export const META_REQUIRED_SCOPE = 'ads_read';
+
+/** Thrown when Meta issued a token that lacks {@link META_REQUIRED_SCOPE}. */
+export class MetaPermissionsError extends Error {
+  constructor(readonly granted: string | null) {
+    super(`Meta granted only [${granted ?? ''}]; ${META_REQUIRED_SCOPE} is required`);
+    this.name = 'MetaPermissionsError';
+  }
+}
+
+/** What `GET /debug_token` says about a token, reduced to what we store. */
+export interface MetaTokenInfo {
+  scopes: string[];
+  /** `null` when the token never expires (Meta reports `expires_at: 0`). */
+  expiresAt: Date | null;
+}
+
+/** Reduce a raw `debug_token` response body; `null` when it isn't one. */
+export function parseDebugToken(json: unknown): MetaTokenInfo | null {
+  const data = (json as { data?: { scopes?: unknown; expires_at?: unknown } } | null)?.data;
+  if (!data || !Array.isArray(data.scopes)) return null;
+  const scopes = data.scopes.filter((s): s is string => typeof s === 'string');
+  const expiresAt =
+    typeof data.expires_at === 'number' && data.expires_at > 0
+      ? new Date(data.expires_at * 1000)
+      : null;
+  return { scopes, expiresAt };
+}
+
+/**
+ * Whether a stored (space-separated) scope string carries the required
+ * permission. Unknown scopes (`null`) pass: when Meta told us nothing, the
+ * connect goes through and the first tool call surfaces the real error.
+ */
+export function hasRequiredMetaScope(scopes: string | null): boolean {
+  if (scopes === null) return true;
+  return scopes.split(/[\s,]+/).includes(META_REQUIRED_SCOPE);
+}
 
 /** A `meta` connection exposed to an LLM as one Meta hosted MCP server. */
 export interface MetaMcpServer {
@@ -245,6 +291,15 @@ export class MetaMcpService implements OnModuleInit {
       redirect_uri: this.cfg.redirectUri,
       code_verifier: codeVerifier,
     });
+    // Meta's token response carries no `scope`, so without this the row's scopes
+    // stay null and a permission-less token is indistinguishable from a good one.
+    if (tokens.scopes === null) {
+      const info = await this.inspectToken(tokens.accessToken);
+      if (info) {
+        tokens.scopes = info.scopes.join(' ');
+        tokens.expiresAt ??= info.expiresAt;
+      }
+    }
     const identity = await this.resolveAccount(tokens.accessToken);
     return {
       ...tokens,
@@ -293,6 +348,30 @@ export class MetaMcpService implements OnModuleInit {
   }
 
   /**
+   * Ask Meta what a token can do and when it dies. Needs an app access token
+   * (`id|secret`), so it is skipped when no client secret is configured; any
+   * failure is logged and treated as "unknown" rather than blocking the connect.
+   */
+  private async inspectToken(accessToken: string): Promise<MetaTokenInfo | null> {
+    const { clientId, clientSecret } = await this.getClient();
+    if (!clientSecret) return null;
+    try {
+      const url = new URL(`${GRAPH_BASE}/debug_token`);
+      url.searchParams.set('input_token', accessToken);
+      url.searchParams.set('access_token', `${clientId}|${clientSecret}`);
+      const res = await fetch(url);
+      if (!res.ok) {
+        this.logger.warn(`Meta debug_token failed (${res.status}): ${await res.text()}`);
+        return null;
+      }
+      return parseDebugToken(await res.json());
+    } catch (error) {
+      this.logger.warn(`Meta debug_token failed: ${this.messageOf(error)}`);
+      return null;
+    }
+  }
+
+  /**
    * Best-effort account identity for the freshly granted token. Meta's token
    * response doesn't carry an ad-account id, so we ask the Graph API who the
    * token belongs to; if that's unavailable we fall back to a random id so the
@@ -303,7 +382,7 @@ export class MetaMcpService implements OnModuleInit {
   ): Promise<{ accountId: string; accountName: string | null }> {
     try {
       const res = await fetch(
-        `https://graph.facebook.com/v21.0/me?fields=id,name&access_token=${encodeURIComponent(accessToken)}`,
+        `${GRAPH_BASE}/me?fields=id,name&access_token=${encodeURIComponent(accessToken)}`,
       );
       if (res.ok) {
         const me = (await res.json()) as { id?: string; name?: string };

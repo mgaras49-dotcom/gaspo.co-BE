@@ -7,7 +7,12 @@ import { REDIS_CLIENT } from '../common/constants';
 import { META_ADS_TOOLS } from '../ai/meta-ads-tools';
 import { Integration, IntegrationAccessLevel, IntegrationProvider } from '../database/entities';
 import { ConfirmConnectionDto } from './dto';
-import { MetaMcpServer, MetaMcpService } from './meta-mcp.service';
+import {
+  hasRequiredMetaScope,
+  MetaMcpServer,
+  MetaMcpService,
+  MetaPermissionsError,
+} from './meta-mcp.service';
 import { AppTool, PipedreamService } from './pipedream.service';
 import { checkShopifyConnection, SHOPIFY_APP_SLUGS, shopifyAccountName } from './shopify-check';
 import type { SheetsCredential } from './sheets.service';
@@ -482,6 +487,11 @@ export class IntegrationsService {
     const { workspaceId, userId, accessLevel, codeVerifier } = JSON.parse(raw) as MetaOAuthState;
 
     const connection = await this.metaMcp.exchangeCode(code, codeVerifier);
+    // A token without the ad permissions would be stored as a working connection
+    // and then fail every tool call; better to refuse now with a reason.
+    if (!hasRequiredMetaScope(connection.scopes)) {
+      throw new MetaPermissionsError(connection.scopes);
+    }
 
     const existing = await this.integrationRepository.findOne({
       where: { workspaceId, externalAccountId: connection.accountId },
