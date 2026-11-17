@@ -192,6 +192,13 @@ const UPDATE_CAMPAIGN_TOOL: ToolSpec = {
         type: 'number',
         description: 'New daily budget in the account currency minor unit (×100).',
       },
+      bid_strategy: {
+        type: 'string',
+        enum: ['LOWEST_COST_WITHOUT_CAP', 'LOWEST_COST_WITH_BID_CAP', 'COST_CAP'],
+        description:
+          'Bid strategy for a campaign with a campaign-level budget. LOWEST_COST_WITHOUT_CAP ' +
+          'needs no bid amount; the other two require a bid_amount on every ad set.',
+      },
       ...CONFIRMED_PROP,
     },
     required: ['campaign_id', 'confirmed'],
@@ -256,7 +263,9 @@ const CREATE_AD_SET_TOOL: ToolSpec = {
     'Create an ad set (audience, budget, schedule) under a campaign. Always created PAUSED. ' +
     'Pick optimization_goal/billing_event to match the campaign objective (e.g. Traffic → ' +
     'optimization_goal LINK_CLICKS, billing_event IMPRESSIONS). Build targeting per Meta’s spec; ' +
-    'resolve interests to ids with meta_ads_search_interests first. Confirm details with the user.',
+    'resolve interests to ids with meta_ads_search_interests first. Confirm details with the user. ' +
+    'Budget lives in one place: if the campaign has a campaign-level budget, the ad set shares it ' +
+    'and daily_budget here is ignored (tell the user); otherwise the ad set needs its own.',
   parameters: {
     type: 'object',
     properties: {
@@ -272,6 +281,12 @@ const CREATE_AD_SET_TOOL: ToolSpec = {
         type: 'number',
         description:
           'Daily budget in the account currency minor unit (×100, e.g. 50000 = 500 PKR).',
+      },
+      bid_amount: {
+        type: 'number',
+        description:
+          'Bid cap or cost target in the minor unit. Only needed when the campaign uses ' +
+          'LOWEST_COST_WITH_BID_CAP or COST_CAP; leave out for lowest cost.',
       },
       targeting: {
         type: 'object',
