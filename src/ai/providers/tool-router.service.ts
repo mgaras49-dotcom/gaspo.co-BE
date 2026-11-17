@@ -8,12 +8,6 @@ import { LlmProvider, RemoteMcpServer, ToolSpec } from './provider.interface';
 const ROUTE_THRESHOLD = 20;
 
 /**
- * Below this many connected servers there is nothing to route: with one server
- * the choice is send-it-or-fail, and the round-trip costs more than it saves.
- */
-const SERVER_ROUTE_THRESHOLD = 1;
-
-/**
  * Below this many actions an app is cheap enough to expose whole. Far lower than
  * {@link ROUTE_THRESHOLD} because an action's schema is large — a handful of
  * them already outweighs the router call that would narrow them.
@@ -142,7 +136,15 @@ export class ToolRouterService {
     if (!names) return null;
 
     const selected = considered.filter((action) => names.has(action.name));
-    if (!selected.length) return null;
+    if (!selected.length) {
+      // The same ambiguity as above: "none of these" and "the model dropped
+      // them" look alike. The caller then exposes the app whole, which is
+      // expensive, so say that it happened.
+      this.logger.warn(
+        `Action router picked none of ${actions.length} actions; exposing the app whole`,
+      );
+      return null;
+    }
 
     this.logger.log(`Action router kept ${selected.length}/${actions.length} actions for this run`);
     // Sorted so the same set always renders the same bytes: the toolset sits in
@@ -220,7 +222,13 @@ export class ToolRouterService {
     servers: RemoteMcpServer[],
     localTools: ToolSpec[] = [],
   ): Promise<RemoteMcpServer[] | null> {
-    if (servers.length <= SERVER_ROUTE_THRESHOLD) return null;
+    if (!servers.length) return null;
+    // One server is still a decision, not send-it-or-fail: the built-in tools
+    // cover whole domains (Meta Ads), so for most messages the right answer is
+    // to attach nothing. Skipping here attached a lone Shopify to every Meta
+    // question in a workspace; its action router then found nothing relevant,
+    // failed open to the whole 57-action catalogue, and the thread remembered
+    // that — a 595K-token prompt in which the model lost the Meta tools.
 
     // An app with several accounts lists each one, so a request about one
     // Shopify store attaches that store and not all thirty of them.

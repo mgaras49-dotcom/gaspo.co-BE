@@ -86,8 +86,21 @@ void test('selectRelevantServers falls back when the provider fails', async () =
   assert.equal(await select(new Error('503')), null);
 });
 
-void test('selectRelevantServers skips routing for a single server', async () => {
-  assert.equal(await select('["google_sheets"]', SERVERS.slice(0, 1)), null);
+void test('selectRelevantServers routes a single server too, so it can be left out', async () => {
+  // A lone connected app used to be attached to every message unrouted. In a
+  // workspace with Meta (built in) and only Shopify connected, that put Shopify
+  // on every Meta question, and once its action router found nothing relevant
+  // the whole catalogue rode along for the rest of the thread.
+  assert.deepEqual(await select('[]', SERVERS.slice(0, 1)), []);
+  const selected = await select('["google_sheets"]', SERVERS.slice(0, 1));
+  assert.deepEqual(
+    selected?.map((server) => server.appSlug),
+    ['google_sheets'],
+  );
+});
+
+void test('selectRelevantServers has nothing to do with no servers', async () => {
+  assert.equal(await select('[]', []), null);
 });
 
 void test('selectRelevantServers tells the router which tools are built in', async () => {
