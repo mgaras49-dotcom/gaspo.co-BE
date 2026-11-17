@@ -16,4 +16,23 @@ export class MetaCallbackDto {
   @IsOptional()
   @IsString()
   error?: string;
+
+  // Meta adds these three plus `action=cancel` when the person backs out of the
+  // dialog. The global pipe forbids unknown query keys, so without them listed
+  // a cancel came back as a raw 400 JSON page instead of the dashboard.
+  @IsOptional()
+  @IsString()
+  error_code?: string;
+
+  @IsOptional()
+  @IsString()
+  error_description?: string;
+
+  @IsOptional()
+  @IsString()
+  error_reason?: string;
+
+  @IsOptional()
+  @IsString()
+  action?: string;
 }
