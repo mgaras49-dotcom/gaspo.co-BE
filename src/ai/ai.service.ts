@@ -989,6 +989,10 @@ export class AiService {
     // Rule-engine guidance rides along with a Meta connection.
     if (hasMeta) {
       system +=
+        '\n\nMeta Ads data — ad accounts, campaigns, ad sets, ads, creatives, Pages and performance ' +
+        'insights — comes only from the meta_ads_* tools, which are always available to you. No other ' +
+        "connected app's tools stand in for them, however similar they look (a shop's orders or " +
+        'analytics are not ad insights). If a meta_ads_* call fails, report its error as it is.' +
         '\n\nYou can set up automated ad rules with create_ad_rule: scheduled checks that alert, ' +
         'pause, or scale campaigns/ad sets when a metric (CPA, ROAS, spend…) breaches a threshold — ' +
         'e.g. overnight pausing of losing campaigns or morning budget scaling of winners. ' +
@@ -1182,6 +1186,15 @@ export class AiService {
       answer += response.text;
       // Tools the provider ran itself are already complete; ours still need executing.
       actions.push(...response.remoteActivity);
+      // Nothing else records which tools a run called, so when an answer says
+      // "my Meta request ran as a Shopify search" this line is the only evidence.
+      if (response.remoteActivity.length || response.toolCalls.length) {
+        this.logger.log(
+          `Turn ${i + 1} tools: remote=[${response.remoteActivity
+            .map((a) => `${a.app}/${a.tool}${a.isError ? '!' : ''}`)
+            .join(' ')}] local=[${response.toolCalls.map((c) => c.name).join(' ')}]`,
+        );
+      }
 
       if (response.stopReason === 'tool_use' && response.toolCalls.length) {
         messages.push({
