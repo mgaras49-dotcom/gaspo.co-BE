@@ -28,6 +28,18 @@ import { ConnectedIntegrationView, IntegrationsService } from './integrations.se
 import { MetaPermissionsError } from './meta-mcp.service';
 import { AppTool } from './pipedream.service';
 
+/**
+ * The one-word reason the dashboard gets after a failed Meta connect. Two
+ * failures the person can act on themselves are named: they backed out of the
+ * dialog, or Meta issued a token without the ad permissions (re-tick them, or
+ * get a role on the app). Everything else is a plain `meta`.
+ */
+function metaErrorCode(query: MetaCallbackDto, error: unknown): string {
+  if (query.error_reason === 'user_denied' || query.action === 'cancel') return 'meta_cancelled';
+  if (error instanceof MetaPermissionsError) return 'meta_permissions';
+  return 'meta';
+}
+
 @ApiTags('integrations')
 @Controller('integrations')
 export class IntegrationsController {
@@ -111,7 +123,11 @@ export class IntegrationsController {
     const redirect = new URL('/dashboard/integrations', frontendUrl);
     try {
       if (query.error || !query.code || !query.state) {
-        throw new Error(query.error ?? 'Missing code/state from Meta');
+        throw new Error(
+          query.error
+            ? `${query.error}: ${query.error_description ?? ''} (${query.error_reason ?? ''})`
+            : 'Missing code/state from Meta',
+        );
       }
       await this.integrationsService.completeMetaConnect(query.state, query.code);
       redirect.searchParams.set('connected', 'meta');
@@ -121,12 +137,7 @@ export class IntegrationsController {
       this.logger.warn(
         `Meta connect failed: ${error instanceof Error ? error.message : String(error)}`,
       );
-      // Missing permissions is the one failure the user can act on themselves
-      // (re-tick the permissions, or get a role on the app), so name it.
-      redirect.searchParams.set(
-        'error',
-        error instanceof MetaPermissionsError ? 'meta_permissions' : 'meta',
-      );
+      redirect.searchParams.set('error', metaErrorCode(query, error));
     }
     res.redirect(redirect.toString());
   }
