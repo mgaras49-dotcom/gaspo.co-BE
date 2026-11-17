@@ -2236,6 +2236,7 @@ export class AiService {
           name: input.name as string | undefined,
           status: input.status as 'ACTIVE' | 'PAUSED' | undefined,
           dailyBudget: input.daily_budget as number | undefined,
+          bidStrategy: input.bid_strategy as string | undefined,
         });
       } else if (toolUse.name === META_ADS_DELETE_CAMPAIGN) {
         result = await this.metaAds.deleteCampaign(token, String(input.campaign_id));
@@ -2256,6 +2257,7 @@ export class AiService {
           billingEvent: String(input.billing_event),
           targeting: (input.targeting ?? {}) as Record<string, unknown>,
           dailyBudget: input.daily_budget as number | undefined,
+          bidAmount: input.bid_amount as number | undefined,
           startTime: input.start_time as string | undefined,
         });
       } else if (toolUse.name === META_ADS_UPDATE_AD_SET) {

@@ -55,6 +55,7 @@ export interface UpdateCampaignParams {
   name?: string;
   status?: 'ACTIVE' | 'PAUSED';
   dailyBudget?: number;
+  bidStrategy?: string;
 }
 
 export interface CreateAdSetParams {
@@ -68,8 +69,106 @@ export interface CreateAdSetParams {
   dailyBudget?: number;
   lifetimeBudget?: number;
   bidStrategy?: string;
+  /** Bid cap / cost target in minor units; needed under a capped bid strategy. */
+  bidAmount?: number;
   startTime?: string;
   endTime?: string;
+}
+
+/** The parent campaign fields an ad set's request body depends on. */
+export interface CampaignBudgetInfo {
+  daily_budget?: string;
+  lifetime_budget?: string;
+  bid_strategy?: string;
+}
+
+/** The strategy Meta applies when none is given; it never needs a bid amount. */
+export const LOWEST_COST = 'LOWEST_COST_WITHOUT_CAP';
+
+/** Bid strategies that reject an ad set without a `bid_amount` (error 1815857). */
+const CAPPED_BID_STRATEGIES = new Set(['LOWEST_COST_WITH_BID_CAP', 'COST_CAP', 'TARGET_COST']);
+
+function hasBudget(campaign: CampaignBudgetInfo): boolean {
+  return Number(campaign.daily_budget ?? 0) > 0 || Number(campaign.lifetime_budget ?? 0) > 0;
+}
+
+/**
+ * The Graph body for a new campaign. When the campaign carries its own budget
+ * (Advantage campaign budget) we name the bid strategy explicitly: left out,
+ * Meta defaulted a budgeted campaign to LOWEST_COST_WITH_BID_CAP (seen 17 Nov
+ * 2026), and that strategy then rejects every ad set created without a bid cap.
+ */
+export function buildCampaignBody(params: CreateCampaignParams): Record<string, string> {
+  const body: Record<string, string> = {
+    name: params.name,
+    objective: params.objective,
+    status: 'PAUSED',
+    special_ad_categories: JSON.stringify([]),
+  };
+  if (params.dailyBudget != null) body.daily_budget = String(params.dailyBudget);
+  if (params.lifetimeBudget != null) body.lifetime_budget = String(params.lifetimeBudget);
+  if (params.dailyBudget == null && params.lifetimeBudget == null) {
+    // Meta requires this flag when the campaign carries no campaign-level budget
+    // (ad-set budgets); false keeps ad sets from sharing budget.
+    body.is_adset_budget_sharing_enabled = 'false';
+  } else {
+    body.bid_strategy = LOWEST_COST;
+  }
+  return body;
+}
+
+/**
+ * The Graph body for a new ad set under `campaign`. Meta allows a budget on the
+ * campaign or on its ad sets, never both ("You can only set an ad set budget or
+ * a campaign budget", 1885621), and under a campaign budget every ad set shares
+ * the campaign's bid strategy. So with a campaign budget the ad set's own budget
+ * and strategy are left out, and a capped campaign strategy needs `bidAmount`.
+ * Without a campaign budget the ad set must bring its own.
+ */
+export function buildAdSetBody(
+  params: CreateAdSetParams,
+  campaign: CampaignBudgetInfo,
+): Record<string, string> {
+  const targeting = { ...params.targeting };
+  // Meta now requires the Advantage-audience flag in the targeting spec, so we
+  // default it off when the caller omits it.
+  if (!targeting.targeting_automation) targeting.targeting_automation = { advantage_audience: 0 };
+  const body: Record<string, string> = {
+    name: params.name,
+    campaign_id: params.campaignId,
+    optimization_goal: params.optimizationGoal,
+    billing_event: params.billingEvent,
+    targeting: JSON.stringify(targeting),
+    status: 'PAUSED',
+  };
+  if (hasBudget(campaign)) {
+    const strategy = campaign.bid_strategy ?? LOWEST_COST;
+    if (CAPPED_BID_STRATEGIES.has(strategy)) {
+      if (params.bidAmount == null) {
+        throw new Error(
+          `Campaign ${params.campaignId} has a campaign budget with bid strategy ${strategy}, ` +
+            `which needs a bid cap: pass bid_amount (minor units), or first set the campaign's ` +
+            `bid_strategy to ${LOWEST_COST} with meta_ads_update_campaign.`,
+        );
+      }
+      body.bid_amount = String(params.bidAmount);
+    }
+  } else {
+    if (params.dailyBudget == null && params.lifetimeBudget == null) {
+      throw new Error(
+        `Campaign ${params.campaignId} has no campaign budget, so the ad set needs a ` +
+          `daily_budget or lifetime_budget.`,
+      );
+    }
+    if (params.dailyBudget != null) body.daily_budget = String(params.dailyBudget);
+    if (params.lifetimeBudget != null) body.lifetime_budget = String(params.lifetimeBudget);
+    body.bid_strategy =
+      params.bidStrategy ?? (params.bidAmount != null ? 'LOWEST_COST_WITH_BID_CAP' : LOWEST_COST);
+    if (params.bidAmount != null) body.bid_amount = String(params.bidAmount);
+  }
+  if (params.startTime) body.start_time = params.startTime;
+  if (params.endTime) body.end_time = params.endTime;
+  return body;
 }
 
 export interface UpdateAdSetParams {
@@ -191,28 +290,20 @@ export class MetaAdsService {
    * requires `special_ad_categories` (empty array for ordinary campaigns).
    */
   createCampaign(accessToken: string, params: CreateCampaignParams): Promise<{ id: string }> {
-    const body: Record<string, string> = {
-      name: params.name,
-      objective: params.objective,
-      status: 'PAUSED',
-      special_ad_categories: JSON.stringify([]),
-    };
-    if (params.dailyBudget != null) body.daily_budget = String(params.dailyBudget);
-    if (params.lifetimeBudget != null) body.lifetime_budget = String(params.lifetimeBudget);
-    // Meta requires this flag when the campaign carries no campaign-level budget
-    // (ad-set budgets); false keeps ad sets from sharing budget.
-    if (params.dailyBudget == null && params.lifetimeBudget == null) {
-      body.is_adset_budget_sharing_enabled = 'false';
-    }
-    return this.post(`${this.normalizeAccount(params.adAccountId)}/campaigns`, accessToken, body);
+    return this.post(
+      `${this.normalizeAccount(params.adAccountId)}/campaigns`,
+      accessToken,
+      buildCampaignBody(params),
+    );
   }
 
-  /** Update a campaign's name, status (activate/pause), or daily budget. */
+  /** Update a campaign's name, status (activate/pause), daily budget or bid strategy. */
   updateCampaign(accessToken: string, params: UpdateCampaignParams): Promise<{ success: boolean }> {
     const body: Record<string, string> = {};
     if (params.name != null) body.name = params.name;
     if (params.status != null) body.status = params.status;
     if (params.dailyBudget != null) body.daily_budget = String(params.dailyBudget);
+    if (params.bidStrategy != null) body.bid_strategy = params.bidStrategy;
     return this.post(params.campaignId, accessToken, body);
   }
 
@@ -261,26 +352,18 @@ export class MetaAdsService {
   }
 
   /**
-   * Create an ad set (PAUSED). Meta now requires the Advantage-audience flag in
-   * the targeting spec, so we default it off when the caller omits it.
+   * Create an ad set (PAUSED). The body depends on whether the parent campaign
+   * carries its own budget, see {@link buildAdSetBody}, so the campaign is read first.
    */
-  createAdSet(accessToken: string, params: CreateAdSetParams): Promise<{ id: string }> {
-    const targeting = { ...params.targeting } as Record<string, unknown>;
-    if (!targeting.targeting_automation) targeting.targeting_automation = { advantage_audience: 0 };
-    const body: Record<string, string> = {
-      name: params.name,
-      campaign_id: params.campaignId,
-      optimization_goal: params.optimizationGoal,
-      billing_event: params.billingEvent,
-      bid_strategy: params.bidStrategy ?? 'LOWEST_COST_WITHOUT_CAP',
-      targeting: JSON.stringify(targeting),
-      status: 'PAUSED',
-    };
-    if (params.dailyBudget != null) body.daily_budget = String(params.dailyBudget);
-    if (params.lifetimeBudget != null) body.lifetime_budget = String(params.lifetimeBudget);
-    if (params.startTime) body.start_time = params.startTime;
-    if (params.endTime) body.end_time = params.endTime;
-    return this.post(`${this.normalizeAccount(params.adAccountId)}/adsets`, accessToken, body);
+  async createAdSet(accessToken: string, params: CreateAdSetParams): Promise<{ id: string }> {
+    const campaign = await this.get<CampaignBudgetInfo>(params.campaignId, accessToken, {
+      fields: 'daily_budget,lifetime_budget,bid_strategy',
+    });
+    return this.post(
+      `${this.normalizeAccount(params.adAccountId)}/adsets`,
+      accessToken,
+      buildAdSetBody(params, campaign),
+    );
   }
 
   /** Update an ad set's name, status, or daily budget. */
